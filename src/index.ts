@@ -30,7 +30,8 @@ import {
   type PromptHints,
 } from './model-cache.js';
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, basename } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { isAbsolute, basename, resolve, sep, delimiter } from 'node:path';
 
 // Env var naming: HOUTINI_LM_* is the preferred namespace now that we
 // support more than just LM Studio. The legacy LM_STUDIO_* names remain
@@ -62,6 +63,50 @@ const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
   10,
 );
+
+// ── Filesystem access policy (code_task_files) ───────────────────────
+// code_task_files reads files from disk and ships their contents to the
+// configured LLM endpoint — which, with a remote provider (OpenRouter, or
+// any non-localhost OpenAI-compatible URL), sends them off the machine.
+// Without a boundary, a prompt-injection-driven confused-deputy could ask
+// the tool to read ~/.ssh/id_rsa, .env, ~/.aws/credentials, etc. and exfil
+// the contents. So reads are confined to an allowlist of roots.
+//
+// Default: the server's working directory. Override with
+// HOUTINI_LM_ALLOWED_ROOTS — a list of absolute paths separated by commas
+// or the OS path delimiter (':' on POSIX, ';' on Windows). When set, the
+// listed roots REPLACE the default (they are the whole boundary), so list
+// every directory the local model is allowed to read.
+const MAX_FILES_PER_CALL = 50;                 // refuse absurd batches outright
+const MAX_TOTAL_READ_BYTES = 12 * 1024 * 1024; // 12 MB across all files in one call
+
+/** Resolve a path to its canonical real path; fall back to a lexical resolve
+ *  when the path doesn't exist yet (nothing to read = nothing to leak). */
+function canonicalize(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+const ALLOWED_ROOTS: string[] = (() => {
+  const raw = process.env.HOUTINI_LM_ALLOWED_ROOTS || '';
+  const parts = raw
+    .split(new RegExp(`[,${delimiter === ':' ? ':' : ';'}]`))
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((p) => isAbsolute(p));
+  const roots = parts.length > 0 ? parts : [process.cwd()];
+  return roots.map(canonicalize);
+})();
+
+/** True when realPath sits inside (or is) one of the allowed roots. Both the
+ *  candidate and the roots are canonicalised first, so symlinks that point
+ *  outside an allowed root are rejected rather than followed out of bounds. */
+function isWithinAllowedRoots(realPath: string): boolean {
+  return ALLOWED_ROOTS.some((root) => realPath === root || realPath.startsWith(root + sep));
+}
 
 // ── Session-level token accounting ───────────────────────────────────
 // Tracks cumulative tokens offloaded to the local LLM across all calls
@@ -1684,7 +1729,7 @@ const TOOLS = [
         paths: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute file paths to analyse. Relative paths are rejected — always pass absolute.',
+          description: 'Absolute file paths to analyse. Relative paths are rejected — always pass absolute. Reads are confined to the server working directory (or the roots set in HOUTINI_LM_ALLOWED_ROOTS); paths outside the allowed roots are refused, since file contents are sent to the configured LLM endpoint.',
         },
         task: {
           type: 'string',
@@ -1985,6 +2030,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        // Cap the batch size — a huge list is either a mistake or an attempt to
+        // sweep the filesystem. (Total byte budget is enforced after reading.)
+        if (paths.length > MAX_FILES_PER_CALL) {
+          return {
+            content: [{ type: 'text', text: `Error: too many files in one call (${paths.length} > ${MAX_FILES_PER_CALL}). Split the request into smaller batches.` }],
+            isError: true,
+          };
+        }
+
+        // Confine reads to the allowed roots. Canonicalise (resolving symlinks)
+        // before the check so a symlink pointing outside an allowed root can't
+        // smuggle, e.g., ~/.ssh/id_rsa or /etc/passwd into the prompt — and from
+        // there to the configured endpoint, which may be a remote provider.
+        const denied = paths.filter((p) => !isWithinAllowedRoots(canonicalize(p)));
+        if (denied.length > 0) {
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Error: ${denied.length} path(s) are outside the allowed roots and were not read:\n` +
+                denied.map((p) => `  • ${p}`).join('\n') +
+                `\n\nAllowed roots:\n` +
+                ALLOWED_ROOTS.map((r) => `  • ${r}`).join('\n') +
+                `\n\nFile contents are sent to the configured LLM endpoint, so reads are confined to these roots. ` +
+                `Set HOUTINI_LM_ALLOWED_ROOTS (comma- or path-delimiter-separated absolute paths) to widen the boundary.`,
+            }],
+            isError: true,
+          };
+        }
+
         // Read all files in parallel. One unreadable file doesn't sink the call —
         // failures become inline error sections so the model can still reason about
         // the rest of the bundle.
@@ -1994,16 +2069,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const sections: string[] = [];
         let successCount = 0;
+        let totalReadBytes = 0;
         reads.forEach((r, i) => {
           const p = paths[i];
           if (r.status === 'fulfilled') {
             successCount++;
+            totalReadBytes += Buffer.byteLength(r.value.content, 'utf8');
             sections.push(`=== ${basename(p)} (${p}) ===\n${r.value.content}`);
           } else {
             const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
             sections.push(`=== ${basename(p)} (${p}) — READ FAILED ===\n[Could not read: ${reason}]`);
           }
         });
+
+        // Enforce the total byte budget — a single oversized file can blow past
+        // the per-call limit even when the file count is small.
+        if (totalReadBytes > MAX_TOTAL_READ_BYTES) {
+          return {
+            content: [{ type: 'text', text: `Error: total file size (${(totalReadBytes / 1024 / 1024).toFixed(1)} MB) exceeds the ${(MAX_TOTAL_READ_BYTES / 1024 / 1024).toFixed(0)} MB per-call limit. Pass fewer or smaller files.` }],
+            isError: true,
+          };
+        }
 
         if (successCount === 0) {
           return {

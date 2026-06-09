@@ -14,58 +14,74 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-    
+
     - name: Install dependencies
       run: npm ci
-    
+
     - name: Build
       run: npm run build
-    
+
     - name: Get the version
       id: get_version
       run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-    
+
     - name: Get tag message
       id: tag_message
+      # VERSION comes via env (never inlined into the command) so a crafted tag
+      # name can't break out of the shell. The tag *message* is captured verbatim
+      # and treated as untrusted data downstream.
+      env:
+        VERSION: ${{ steps.get_version.outputs.VERSION }}
       run: |
-        TAG_MESSAGE=$(git tag -l --format='%(contents)' ${{ steps.get_version.outputs.VERSION }})
-        echo "TAG_MESSAGE<<EOF" >> $GITHUB_OUTPUT
-        echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
-    
+        TAG_MESSAGE=$(git tag -l --format='%(contents)' "$VERSION")
+        echo "TAG_MESSAGE<<EOF" >> "$GITHUB_OUTPUT"
+        echo "$TAG_MESSAGE" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
     - name: Generate release notes
       id: release_notes
+      # The tag message and version are passed through env vars and referenced
+      # as quoted shell variables ("$TAG_MESSAGE"), NOT interpolated inline with
+      # ${{ ... }}. Inline interpolation would let a tag message containing shell
+      # metacharacters (e.g. $(...) or backticks) execute on the runner — a
+      # script-injection vector, given this job has `contents: write`.
+      env:
+        VERSION: ${{ steps.get_version.outputs.VERSION }}
+        TAG_MESSAGE: ${{ steps.tag_message.outputs.TAG_MESSAGE }}
+        REPO: ${{ github.repository }}
       run: |
-        echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
-        echo "# Local LLM MCP ${{ steps.get_version.outputs.VERSION }}" >> $GITHUB_OUTPUT
-        echo "" >> $GITHUB_OUTPUT
-        
-        # If tag has a message, use it
-        if [ -n "${{ steps.tag_message.outputs.TAG_MESSAGE }}" ]; then
-          echo "${{ steps.tag_message.outputs.TAG_MESSAGE }}" >> $GITHUB_OUTPUT
-        else
-          # Otherwise generate default notes
-          echo "## 📦 Installation" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo '```bash' >> $GITHUB_OUTPUT
-          echo "git clone https://github.com/${{ github.repository }}.git" >> $GITHUB_OUTPUT
-          echo "cd local-llm-mcp" >> $GITHUB_OUTPUT
-          echo "npm install" >> $GITHUB_OUTPUT
-          echo "npm run build" >> $GITHUB_OUTPUT
-          echo '```' >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "## 📚 Documentation" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "- [Complete Guide](https://github.com/${{ github.repository }}/blob/main/COMPLETE_GUIDE.md)" >> $GITHUB_OUTPUT
-          echo "- [Getting Started](https://github.com/${{ github.repository }}/blob/main/GETTING_STARTED.md)" >> $GITHUB_OUTPUT
-        fi
-        echo "EOF" >> $GITHUB_OUTPUT
-    
+        {
+          echo "RELEASE_NOTES<<EOF"
+          echo "# Local LLM MCP $VERSION"
+          echo ""
+
+          # If tag has a message, use it
+          if [ -n "$TAG_MESSAGE" ]; then
+            echo "$TAG_MESSAGE"
+          else
+            # Otherwise generate default notes
+            echo "## 📦 Installation"
+            echo ""
+            echo '```bash'
+            echo "git clone https://github.com/$REPO.git"
+            echo "cd local-llm-mcp"
+            echo "npm install"
+            echo "npm run build"
+            echo '```'
+            echo ""
+            echo "## 📚 Documentation"
+            echo ""
+            echo "- [Complete Guide](https://github.com/$REPO/blob/main/COMPLETE_GUIDE.md)"
+            echo "- [Getting Started](https://github.com/$REPO/blob/main/GETTING_STARTED.md)"
+          fi
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Create Release
       uses: ncipollo/release-action@v1
       with:
