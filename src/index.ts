@@ -58,6 +58,7 @@ const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
 const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
 const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
+const STREAM_PROGRESS_THROTTLE_MS = 500;     // min gap between per-delta streaming progress pings — decoupled from token rate so a fast model can't flood stdio
 const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
   10,
@@ -117,6 +118,27 @@ async function hydrateLifetimeFromDb(): Promise<void> {
   }
 }
 
+/**
+ * Generation throughput in tokens/sec, isolating decode time from prefill.
+ * `generationMs` spans connect + prefill + decode; dividing by the whole span
+ * makes a large-prompt call look many times slower than the model actually
+ * decodes, and that pessimistic number is what the footer, the first-call
+ * benchmark, and the persisted per-model stats report back to the orchestrator.
+ * Subtract TTFT so the denominator is the decode window. Returns null when it
+ * can't be measured.
+ *
+ * Known limitation (tracked separately): for thinking models TTFT is time to
+ * first *visible* token, so reasoning time is excluded from the denominator
+ * while reasoning tokens remain in completion_tokens — resolving that needs the
+ * TTFT-vs-reasoning fix, out of scope for this change.
+ */
+function computeTokPerSec(resp: StreamingResult): number | null {
+  if (!resp.usage) return null;
+  const decodeMs = resp.generationMs - (resp.ttftMs ?? 0);
+  if (decodeMs <= 50) return null;
+  return resp.usage.completion_tokens / (decodeMs / 1000);
+}
+
 function recordUsage(resp: StreamingResult) {
   session.calls++;
   const promptTokens = resp.usage?.prompt_tokens ?? 0;
@@ -133,9 +155,7 @@ function recordUsage(resp: StreamingResult) {
   }
 
   // Tok/s used by both session and lifetime stats
-  const tokPerSec = resp.usage && resp.generationMs > 50
-    ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
-    : 0;
+  const tokPerSec = computeTokPerSec(resp) ?? 0;
 
   // Session per-model (unchanged behaviour)
   if (resp.model) {
@@ -292,6 +312,8 @@ interface StreamingResult {
   reasoningFallback?: boolean;
   /** Truncation caused by prefill stall (no chunks received) vs mid-stream stall */
   prefillStall?: boolean;
+  /** Error payload received mid-stream from the backend (OpenRouter/vLLM/llama.cpp emit these) */
+  streamError?: string;
 }
 
 /** OpenAI-compatible response_format for structured output */
@@ -654,6 +676,22 @@ async function chatCompletionStreaming(
   return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
 }
 
+/**
+ * Pull a human-readable message out of an OpenAI-style mid-stream error
+ * payload (`data: {"error":{...}}`). Returns undefined when the chunk carries
+ * no error, so callers can treat a truthy result as "the backend failed".
+ */
+function extractStreamError(json: unknown): string | undefined {
+  if (!json || typeof json !== 'object') return undefined;
+  const err = (json as { error?: unknown }).error;
+  if (!err) return undefined;
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
+    return (err as { message: string }).message;
+  }
+  return JSON.stringify(err);
+}
+
 /** Get the first loaded model's info for context-aware defaults. */
 async function getActiveModel(): Promise<ModelInfo | null> {
   try {
@@ -783,6 +821,22 @@ async function chatCompletionStreamingInner(
     }).catch(() => { /* best-effort — don't break streaming */ });
   };
 
+  // Throttled variant for the per-delta streaming updates. Streaming fires a
+  // progress event on every content/reasoning chunk; on a fast model (e.g.
+  // 145 tok/s) that would be ~145 JSON-RPC notifications/sec over stdio,
+  // flooding the transport and the client's notification handler. Gate those
+  // on a time interval so the notification rate is decoupled from the token
+  // rate — slow models still update often, fast models emit at most one ping
+  // per interval. The immediate connect ping and the interval keepalives below
+  // bypass this deliberately.
+  let lastStreamProgressMs = 0;
+  const sendStreamProgress = (message: string) => {
+    const now = Date.now();
+    if (now - lastStreamProgressMs < STREAM_PROGRESS_THROTTLE_MS) return;
+    lastStreamProgressMs = now;
+    sendProgress(message);
+  };
+
   // Ping once immediately — resets the client's timeout clock as soon as the
   // tool call is acknowledged server-side, regardless of how long prefill or
   // the upstream handshake takes.
@@ -834,6 +888,12 @@ async function chatCompletionStreamingInner(
   let buffer = '';
   let ttftMs: number | undefined;
   let firstChunkReceived = false;
+  // Backends (OpenRouter, vLLM, llama.cpp) can emit an error object mid-stream
+  // — `data: {"error":{...}}` — then close the connection normally. Without
+  // capturing it, the loop parses the payload, matches no field, and returns
+  // the partial/empty content as a clean success. Track it so we can surface
+  // the real cause instead of silently corrupting the result.
+  let streamError: string | undefined;
 
   // Prefill keep-alive — even after HTTP headers flush, the first SSE chunk
   // can still lag while the model finishes prompt processing. Fire a progress
@@ -888,6 +948,17 @@ async function chatCompletionStreamingInner(
 
         try {
           const json = JSON.parse(trimmed.slice(6));
+
+          // Mid-stream error from the backend — capture the cause and stop.
+          // The connection usually closes normally right after, so without
+          // this the partial result would be returned as a success.
+          const errMsg = extractStreamError(json);
+          if (errMsg) {
+            streamError = errMsg;
+            truncated = true;
+            break;
+          }
+
           if (json.model) model = json.model;
 
           const delta = json.choices?.[0]?.delta;
@@ -907,13 +978,13 @@ async function chatCompletionStreamingInner(
               : '';
           if (reasoningChunk) {
             reasoning += reasoningChunk;
-            sendProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
+            sendStreamProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
           }
 
           if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
-            sendProgress(`Streaming... ${content.length} chars`);
+            sendStreamProgress(`Streaming... ${content.length} chars`);
           }
 
           const reason = json.choices?.[0]?.finish_reason;
@@ -925,6 +996,11 @@ async function chatCompletionStreamingInner(
           // Skip unparseable chunks (partial JSON, comments, etc.)
         }
       }
+
+      // A mid-stream error breaks the inner line loop; also stop reading here
+      // rather than waiting out the per-chunk timeout on a connection the
+      // backend is about to close.
+      if (streamError) break;
     }
 
     // Flush remaining buffer — the usage chunk often arrives in the final SSE
@@ -934,6 +1010,11 @@ async function chatCompletionStreamingInner(
       if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
         try {
           const json = JSON.parse(trimmed.slice(6));
+          const errMsg = extractStreamError(json);
+          if (errMsg) {
+            streamError = errMsg;
+            truncated = true;
+          }
           if (json.model) model = json.model;
           const delta = json.choices?.[0]?.delta;
           const finalReasoningChunk = (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0)
@@ -973,6 +1054,14 @@ async function chatCompletionStreamingInner(
   }
 
   const generationMs = Date.now() - startTime;
+
+  // Backend failed mid-stream and produced nothing usable — surface the real
+  // cause as an error rather than returning an empty "success" the orchestrator
+  // would treat as a valid (empty) answer. When partial content did arrive we
+  // keep it but carry streamError through so the footer flags it.
+  if (streamError && !content.trim() && !reasoning.trim()) {
+    throw new Error(`Upstream model error mid-stream: ${streamError}`);
+  }
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
   // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Claude doesn't
@@ -1020,6 +1109,7 @@ async function chatCompletionStreamingInner(
     thinkStripFallback,
     reasoningFallback,
     prefillStall,
+    streamError,
   };
 }
 
@@ -1415,9 +1505,7 @@ interface QualitySignal {
 function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal {
   const hadThinkBlocks = /<think>/.test(rawContent);
   const estimated = !resp.usage && resp.content.length > 0;
-  const tokPerSec = resp.usage && resp.generationMs > 50
-    ? resp.usage.completion_tokens / (resp.generationMs / 1000)
-    : null;
+  const tokPerSec = computeTokPerSec(resp);
 
   return {
     truncated: resp.truncated,
@@ -1482,8 +1570,9 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   const perfParts: string[] = [];
   if (resp.ttftMs !== undefined) perfParts.push(`TTFT: ${resp.ttftMs}ms`);
   let tokPerSec = 0;
-  if (resp.usage && resp.generationMs > 50) {
-    tokPerSec = resp.usage.completion_tokens / (resp.generationMs / 1000);
+  const measuredTokPerSec = computeTokPerSec(resp);
+  if (measuredTokPerSec !== null) {
+    tokPerSec = measuredTokPerSec;
     perfParts.push(`${tokPerSec.toFixed(1)} tok/s`);
   }
   if (resp.generationMs) perfParts.push(`${(resp.generationMs / 1000).toFixed(1)}s`);
@@ -1495,7 +1584,8 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   const quality = assessQuality(resp, resp.rawContent);
   const qualityLine = formatQualityLine(quality);
   if (qualityLine) parts.push(qualityLine);
-  if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
+  if (resp.streamError) parts.push(`⚠ UPSTREAM ERROR (partial result — backend reported: ${resp.streamError})`);
+  else if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
   const benchmarkLine = isFirstBenchmarkedCall(resp.model, tokPerSec)
     ? `📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : ''} — use this to gauge whether to delegate longer tasks.`
@@ -1835,7 +1925,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
+  // `arguments` is optional in the MCP CallTool schema — a client may omit it
+  // entirely for a param-less tool (e.g. `stats` with no filter). Default to an
+  // empty object so handlers that destructure args never throw on `undefined`.
+  const args = request.params.arguments ?? {};
   const progressToken = request.params._meta?.progressToken;
 
   try {
@@ -2120,6 +2214,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
         const available = models.filter((m) => m.state === 'not-loaded');
+
+        // Models are downloaded but none is loaded (LM Studio with nothing
+        // active). `loaded` still includes state-less models from backends that
+        // don't report load state, so this fires only when every model is
+        // genuinely not-loaded. Report it distinctly instead of presenting an
+        // unloaded model as active — delegating to it would trigger an on-demand
+        // load on the first call and likely blow the client's request timeout.
+        if (loaded.length === 0) {
+          const names = (available.length > 0 ? available : models).map((m) => m.id).join(', ');
+          return {
+            content: [{
+              type: 'text',
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${LM_BASE_URL}\nLatency: ${ms}ms\n\nThe server is running but no model is currently loaded. Downloaded models the user can load: ${names}\n\nDo not delegate tasks until a model is loaded.`,
+            }],
+          };
+        }
 
         const primary = loaded[0] || models[0];
         const ctx = getContextLength(primary);
