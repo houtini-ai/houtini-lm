@@ -40,6 +40,8 @@ Claude's the architect. Your local model's the drafter. Claude QAs everything.
 
 ## Quick start
 
+> New to local models? See **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)** — installing LM Studio or a Docker endpoint, getting an OpenAI-compatible URL for houtini, what the smaller models are good at, and which models fit on 16/32/64/96/128 GB of VRAM.
+
 ### Claude Code
 
 ```bash
