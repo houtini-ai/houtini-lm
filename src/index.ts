@@ -29,8 +29,8 @@ import {
   fitPrefillLinear,
   type PromptHints,
 } from './model-cache.js';
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, basename } from 'node:path';
+import { readFile, stat, realpath } from 'node:fs/promises';
+import { isAbsolute, basename, resolve, sep } from 'node:path';
 
 // Env var naming: HOUTINI_LM_* is the preferred namespace now that we
 // support more than just LM Studio. The legacy LM_STUDIO_* names remain
@@ -63,6 +63,67 @@ const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
   10,
 );
+
+// ── code_task_files read guards ──────────────────────────────────────
+// Per-file size cap (default 10 MB) — files are read fully into memory before
+// the token estimator runs, so an unbounded read risks memory exhaustion.
+const MAX_FILE_BYTES = Math.max(1, parseInt(process.env.HOUTINI_LM_MAX_FILE_MB || '10', 10)) * 1024 * 1024;
+// Optional allowlist of directory roots that code_task_files may read from.
+// Unset = current behaviour (any absolute path). When set (colon- or
+// comma-separated), reads are confined to these roots AFTER symlink resolution,
+// so a prompt-injected call can't escape to ~/.ssh/id_rsa via a planted symlink.
+const FILE_ROOTS: string[] = (process.env.HOUTINI_LM_FILE_ROOTS || '')
+  .split(/[:,]/)
+  .map((r) => r.trim())
+  .filter(Boolean)
+  .map((r) => resolve(r));
+
+/**
+ * Read a file for code_task_files with size and (optional) root confinement.
+ * Resolves symlinks first so neither the allowlist check nor the caller can be
+ * tricked by a symlink pointing outside an allowed root. Throws on violation;
+ * the caller turns the throw into an inline "READ FAILED" section.
+ */
+async function readGuardedFile(p: string): Promise<string> {
+  const real = await realpath(p);
+  if (FILE_ROOTS.length > 0) {
+    const ok = FILE_ROOTS.some((root) => real === root || real.startsWith(root + sep));
+    if (!ok) throw new Error('path is outside the allowed roots (HOUTINI_LM_FILE_ROOTS)');
+  }
+  const info = await stat(real);
+  if (!info.isFile()) throw new Error('not a regular file');
+  if (info.size > MAX_FILE_BYTES) {
+    throw new Error(`file is ${(info.size / 1024 / 1024).toFixed(1)} MB, over the ${(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)} MB limit (set HOUTINI_LM_MAX_FILE_MB to raise)`);
+  }
+  return readFile(real, 'utf8');
+}
+
+/**
+ * Redact secrets embedded in an endpoint URL before echoing it to the client
+ * or logs. Strips userinfo (`user:pass@`) and common secret query params
+ * (`api_key`, `token`, …). Returns the input unchanged when it parses to no
+ * secret, so the common `http://localhost:1234` case is displayed verbatim.
+ */
+function redactUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    let hadSecret = false;
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+      hadSecret = true;
+    }
+    for (const key of ['api_key', 'apikey', 'key', 'token', 'password', 'access_token']) {
+      if (u.searchParams.has(key)) {
+        u.searchParams.set(key, '***');
+        hadSecret = true;
+      }
+    }
+    return hadSecret ? u.toString() : raw;
+  } catch {
+    return raw;
+  }
+}
 
 // ── Session-level token accounting ───────────────────────────────────
 // Tracks cumulative tokens offloaded to the local LLM across all calls
@@ -116,6 +177,40 @@ async function hydrateLifetimeFromDb(): Promise<void> {
   } catch (err) {
     process.stderr.write(`[houtini-lm] Lifetime hydration failed (stats will build from this session): ${err}\n`);
   }
+}
+
+/**
+ * Compose the system prompt sent to the local model. Guarantees a non-empty,
+ * directionally-productive instruction on EVERY call — the previous per-handler
+ * merge sent no system message at all when the caller passed none and the model
+ * family had no outputConstraint (Llama/Nemotron/Granite/gpt-oss/unknown).
+ * Layers, in order:
+ *   base       — persona (+ task, for code tasks); always present
+ *   grounding  — universal anti-hallucination line (the trust lever for the QA loop)
+ *   format     — JSON-only when a json_schema is set (which SUPPRESSES the
+ *                markdown guidance that would otherwise contradict it);
+ *                otherwise the task-appropriate format line plus any per-family
+ *                constraint.
+ * Compact by design — every token here is prefill the estimator and latency pay for.
+ */
+function buildSystemPrompt(opts: {
+  base: string;
+  formatLine?: string;
+  modelConstraint?: string;
+  structuredOutput?: boolean;
+}): string {
+  const layers: string[] = [opts.base.trim()];
+  layers.push(
+    'Base your answer only on the information provided in this conversation. ' +
+    'If it is insufficient to answer correctly, say what is missing rather than guessing.',
+  );
+  if (opts.structuredOutput) {
+    layers.push('Return only valid JSON conforming to the requested schema — no prose, no markdown, no code fences.');
+  } else {
+    if (opts.formatLine && opts.formatLine.trim()) layers.push(opts.formatLine.trim());
+    if (opts.modelConstraint && opts.modelConstraint.trim()) layers.push(opts.modelConstraint.trim());
+  }
+  return layers.join('\n\n');
 }
 
 /**
@@ -624,19 +719,26 @@ async function fetchWithRetry(
       if ((res.status === 429 || res.status >= 500) && attempt < retries) {
         const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
         try { await res.body?.cancel(); } catch { /* ignore */ }
-        const base = 400 * (attempt + 1);
-        const target = Math.min(Math.max(base, retryAfter ?? 0), 10_000);
-        const delay = Math.round(target * (0.5 + Math.random())); // 0.5×..1.5×
+        // Exponential base capped at 10s, but honour an explicit server
+        // Retry-After (up to 60s) even when larger. Jitter UPWARD only
+        // (target..1.5×) so we never retry before the server-mandated delay.
+        const base = Math.min(400 * (attempt + 1), 10_000);
+        const target = Math.max(base, Math.min(retryAfter ?? 0, 60_000));
+        const delay = Math.round(target * (1 + Math.random() * 0.5));
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
       return res;
     } catch (e) {
       lastErr = e;
-      if (attempt < retries) {
-        const delay = Math.round(400 * (attempt + 1) * (0.5 + Math.random()));
-        await new Promise((r) => setTimeout(r, delay));
-      }
+      // A timeout abort can mean the server already received the POST and began
+      // a (billed) generation — re-POSTing /v1/chat/completions would duplicate
+      // it. Only retry errors that indicate the request never reached the
+      // server (connection refused/reset); never on our own abort.
+      const isAbort = e instanceof Error && e.name === 'AbortError';
+      if (isAbort || attempt >= retries) break;
+      const delay = Math.round(400 * (attempt + 1) * (1 + Math.random() * 0.5));
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -977,6 +1079,12 @@ async function chatCompletionStreamingInner(
               ? delta.reasoning
               : '';
           if (reasoningChunk) {
+            // TTFT = time to first token of ANY channel (true prefill end). For
+            // thinking models the first token is reasoning, not content; setting
+            // TTFT here keeps the prefill estimator from mistaking the whole
+            // reasoning phase for prefill (which caused spurious code_task_files
+            // refusals) and keeps the decode-window tok/s denominator consistent.
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             reasoning += reasoningChunk;
             sendStreamProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
           }
@@ -1023,6 +1131,7 @@ async function chatCompletionStreamingInner(
               ? delta.reasoning
               : '';
           if (finalReasoningChunk) {
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             reasoning += finalReasoningChunk;
           }
           if (typeof delta?.content === 'string' && delta.content.length > 0) {
@@ -1073,7 +1182,19 @@ async function chatCompletionStreamingInner(
   //      real answer. Strip everything up to and including the first closer.
   let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag
-  cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');          // orphaned closing tag
+  // Orphaned closing tag (Ollama Qwen3 streams reasoning on the content channel
+  // then a bare </think> before the answer). Strip everything up to the first
+  // closer — but ONLY when the prefix looks like reasoning, not a real answer
+  // that happens to quote the literal string "</think>". We bias toward NOT
+  // stripping: a leaked reasoning prefix is visible and recoverable, whereas
+  // deleting answer text is silent, unrecoverable loss. Backticks before the
+  // closer indicate quoted/answer code, so we leave those untouched.
+  {
+    const closerIdx = cleanContent.indexOf('</think>');
+    if (closerIdx !== -1 && !cleanContent.slice(0, closerIdx).includes('`')) {
+      cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
+    }
+  }
   cleanContent = cleanContent.trim();
 
   // Safety nets for empty visible output. Try in order:
@@ -1907,7 +2028,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         totalTokensOffloaded: session.promptTokens + session.completionTokens,
       },
       perModel: modelStats,
-      endpoint: LM_BASE_URL,
+      endpoint: redactUrl(LM_BASE_URL),
     };
 
     return {
@@ -1945,17 +2066,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const route = await routeToModel('chat', model);
-        const messages: ChatMessage[] = [];
-        // Inject output constraint into system prompt if the model needs it
-        const systemContent = system
-          ? (route.hints.outputConstraint ? `${system}\n\n${route.hints.outputConstraint}` : system)
-          : (route.hints.outputConstraint || undefined);
-        if (systemContent) messages.push({ role: 'system', content: systemContent });
-        messages.push({ role: 'user', content: message });
 
         const responseFormat: ResponseFormat | undefined = json_schema
           ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
           : undefined;
+
+        const messages: ChatMessage[] = [];
+        messages.push({
+          role: 'system',
+          content: buildSystemPrompt({
+            base: system && system.trim() ? system.trim() : 'You are a precise technical assistant.',
+            formatLine: 'Be direct — no preamble, no restating the question. Use markdown formatting where it helps.',
+            modelConstraint: route.hints.outputConstraint,
+            structuredOutput: !!responseFormat,
+          }),
+        });
+        messages.push({ role: 'user', content: message });
 
         const resp = await chatCompletionStreaming(messages, {
           temperature: temperature ?? route.hints.chatTemp,
@@ -1981,11 +2107,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const route = await routeToModel('analysis', model);
+
+        const responseFormat: ResponseFormat | undefined = json_schema
+          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
+          : undefined;
+
         const messages: ChatMessage[] = [];
-        const systemContent = system
-          ? (route.hints.outputConstraint ? `${system}\n\n${route.hints.outputConstraint}` : system)
-          : (route.hints.outputConstraint || undefined);
-        if (systemContent) messages.push({ role: 'system', content: systemContent });
+        messages.push({
+          role: 'system',
+          content: buildSystemPrompt({
+            base: system && system.trim() ? system.trim() : 'You are a precise technical assistant.',
+            formatLine: 'Be direct — no preamble, no restating the question. Use markdown formatting where it helps.',
+            modelConstraint: route.hints.outputConstraint,
+            structuredOutput: !!responseFormat,
+          }),
+        });
 
         // Multi-turn format prevents context bleed in smaller models.
         // Context goes in a separate user→assistant exchange so the model
@@ -1995,10 +2131,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           messages.push({ role: 'assistant', content: 'Understood. I have read the full context. What would you like me to do with it?' });
         }
         messages.push({ role: 'user', content: instruction });
-
-        const responseFormat: ResponseFormat | undefined = json_schema
-          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
-          : undefined;
 
         const resp = await chatCompletionStreaming(messages, {
           temperature: temperature ?? route.hints.chatTemp,
@@ -2025,16 +2157,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const lang = language || 'unknown';
         const route = await routeToModel('code', model);
-        const outputConstraint = route.hints.outputConstraint
-          ? ` ${route.hints.outputConstraint}`
-          : '';
 
         // Task goes in system message so smaller models don't lose it once
         // the code block fills the attention window. Code is sole user content.
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${lang} developer. Your task: ${task}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.${outputConstraint}`,
+            content: buildSystemPrompt({
+              base: `You are a senior ${lang} developer. Your task: ${task}`,
+              formatLine: 'Be specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.',
+              modelConstraint: route.hints.outputConstraint,
+            }),
           },
           {
             role: 'user',
@@ -2044,7 +2177,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const codeResp = await chatCompletionStreaming(codeMessages, {
           temperature: route.hints.codeTemp,
-          maxTokens: codeMaxTokens ?? DEFAULT_MAX_TOKENS,
+          // Pass the raw value (may be undefined) so the 25%-of-context
+          // auto-derivation in chatCompletionStreamingInner fires when the
+          // caller omits max_tokens — matching code_task_files. Forcing
+          // DEFAULT_MAX_TOKENS here made options.maxTokens always truthy,
+          // capping long generations at 16K regardless of the model's context.
+          maxTokens: codeMaxTokens,
           model: route.modelId,
           progressToken,
         });
@@ -2083,7 +2221,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // failures become inline error sections so the model can still reason about
         // the rest of the bundle.
         const reads = await Promise.allSettled(
-          paths.map(async (p) => ({ path: p, content: await readFile(p, 'utf8') })),
+          paths.map(async (p) => ({ path: p, content: await readGuardedFile(p) })),
         );
 
         const sections: string[] = [];
@@ -2108,9 +2246,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const lang = language || 'unknown';
         const route = await routeToModel('code', model);
-        const outputConstraint = route.hints.outputConstraint
-          ? ` ${route.hints.outputConstraint}`
-          : '';
 
         const combined = sections.join('\n\n');
 
@@ -2159,7 +2294,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output. Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.${outputConstraint}`,
+            content: buildSystemPrompt({
+              base: `You are a senior ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output.`,
+              formatLine: 'Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.',
+              modelConstraint: route.hints.outputConstraint,
+            }),
           },
           {
             role: 'user',
@@ -2197,7 +2336,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `Status: OFFLINE\nEndpoint: ${LM_BASE_URL}\n${reason}\n\nThe local LLM is not available right now. Do not attempt to delegate tasks to it.`,
+              text: `Status: OFFLINE\nEndpoint: ${redactUrl(LM_BASE_URL)}\n${reason}\n\nThe local LLM is not available right now. Do not attempt to delegate tasks to it.`,
             }],
           };
         }
@@ -2207,7 +2346,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `Status: ONLINE (no model loaded)\nEndpoint: ${LM_BASE_URL}\nLatency: ${ms}ms\n\nThe server is running but no model is loaded. Ask the user to load a model in LM Studio.`,
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${redactUrl(LM_BASE_URL)}\nLatency: ${ms}ms\n\nThe server is running but no model is loaded. Ask the user to load a model in LM Studio.`,
             }],
           };
         }
@@ -2226,7 +2365,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `Status: ONLINE (no model loaded)\nEndpoint: ${LM_BASE_URL}\nLatency: ${ms}ms\n\nThe server is running but no model is currently loaded. Downloaded models the user can load: ${names}\n\nDo not delegate tasks until a model is loaded.`,
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${redactUrl(LM_BASE_URL)}\nLatency: ${ms}ms\n\nThe server is running but no model is currently loaded. Downloaded models the user can load: ${names}\n\nDo not delegate tasks until a model is loaded.`,
             }],
           };
         }
@@ -2275,7 +2414,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let text =
           `Status: ONLINE\n` +
-          `Endpoint: ${LM_BASE_URL} (${backendLabel})\n` +
+          `Endpoint: ${redactUrl(LM_BASE_URL)} (${backendLabel})\n` +
           `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
           `Active model: ${primary.id}\n` +
           `Context window: ${ctx.toLocaleString()} tokens\n` +
@@ -2391,13 +2530,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? `${data.usage.prompt_tokens} tokens embedded`
             : '';
 
+          // Round to 7 significant figures for transport. Embedding components
+          // are ~[-1, 1], so this is lossless for any similarity use but roughly
+          // halves the serialised size — which for high-dimension models
+          // (4k–8k dims) keeps the tool result from bloating the client context
+          // or exceeding its result-size limit. Dimensions are preserved.
+          const compact = (embedding as number[]).map((x) => Number(x.toPrecision(7)));
+
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 model: data.model,
                 dimensions: embedding.length,
-                embedding,
+                embedding: compact,
                 usage: usageInfo,
               }),
             }],
@@ -2415,7 +2561,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const lines: string[] = [];
         lines.push(`## Houtini LM stats`);
         lines.push('');
-        lines.push(`**Endpoint**: ${LM_BASE_URL} (${backendLabel})`);
+        lines.push(`**Endpoint**: ${redactUrl(LM_BASE_URL)} (${backendLabel})`);
         if (lifetime.firstSeenAt) {
           lines.push(`**First call on this workstation**: ${new Date(lifetime.firstSeenAt).toISOString().slice(0, 10)}`);
         }
@@ -2508,7 +2654,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write(`Houtini LM server running (${LM_BASE_URL})\n`);
+  process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)})\n`);
 
   // Background: profile all available models via HF → SQLite cache
   // Non-blocking — server is already accepting requests
