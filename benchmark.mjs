@@ -18,8 +18,10 @@
  */
 
 import { readFileSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'node:url';
 
+const REPO = dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const DELEGATION_OVERHEAD = 250; // MCP tool call envelope (tokens)
 
@@ -55,21 +57,33 @@ function tok(text) {
   return Math.ceil((text || '').length / 4);
 }
 
-function loadFile(path) {
-  return readFileSync(path, 'utf-8');
+// Resolve fixtures relative to this repo. Files that live in a *sibling*
+// repo (gemini-mcp) aren't present in a clean checkout — loadFile returns
+// null with a warning so the script never throws before running, and the
+// tasks that depend on them are skipped below.
+function loadFile(relPath) {
+  try {
+    return readFileSync(join(REPO, relPath), 'utf-8');
+  } catch (err) {
+    console.warn(`  ⚠ Fixture not found, skipping: ${relPath} (${err.code || err.message})`);
+    return null;
+  }
 }
 
 // ── Real source files ────────────────────────────────────────────────
 
 const FILES = {
-  indexTs: loadFile(join('C:/MCP/houtini-lm/src/index.ts')),
-  modelCache: loadFile(join('C:/MCP/houtini-lm/src/model-cache.ts')),
-  geminiService: loadFile(join('C:/MCP/gemini-mcp/src/services/gemini/index.ts')),
-  imagePrompt: loadFile(join('C:/MCP/gemini-mcp/src/tools/image-prompt-assistant.ts')),
+  indexTs: loadFile('src/index.ts'),
+  modelCache: loadFile('src/model-cache.ts'),
+  // These originally pointed at a sibling gemini-mcp repo. When that repo
+  // isn't available the associated tasks are skipped gracefully.
+  geminiService: loadFile('src/services/gemini/index.ts'),
+  imagePrompt: loadFile('src/tools/image-prompt-assistant.ts'),
 };
 
 console.log('\nSource files loaded:');
 for (const [name, content] of Object.entries(FILES)) {
+  if (!content) continue;
   const lines = content.split('\n').length;
   console.log(`  ${name}: ${lines} lines, ~${tok(content)} tokens`);
 }
@@ -83,7 +97,7 @@ for (const [name, content] of Object.entries(FILES)) {
 // delegationCost (computed after): overhead + review of local LLM result
 //   The key insight: Claude never reads the source file at all when delegating.
 
-const tasks = [
+const allTasks = [
   // ── Pattern 1: Full file code review (the bread and butter) ────────
   {
     name: 'Code review: index.ts (1352 lines)',
@@ -162,6 +176,17 @@ const tasks = [
     maxTokens: 1024,
   },
 ];
+
+// Skip any task whose source fixture(s) aren't present in this checkout
+// (e.g. the sibling gemini-mcp files) instead of sending "null" to the model.
+const tasks = allTasks.filter((task) => {
+  const missing = task.file.split('+').filter((key) => !FILES[key]);
+  if (missing.length) {
+    console.log(`  ⚠ Skipping "${task.name}" — missing fixture(s): ${missing.join(', ')}`);
+    return false;
+  }
+  return true;
+});
 
 // ── Run benchmark ────────────────────────────────────────────────────
 
