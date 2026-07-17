@@ -291,7 +291,7 @@ Example output:
 
 ```
 ## Houtini LM stats
-**Endpoint**: http://hopper:1234 (LM Studio)
+**Endpoint**: http://gpu-box:1234 (LM Studio)
 **First call on this workstation**: 2026-04-14
 
 ### Totals
@@ -448,6 +448,13 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_MODEL` | *(auto-detect)* | Model identifier — leave blank to use whatever's loaded. Legacy alias: `LM_STUDIO_MODEL`. |
 | `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. Set to `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation. Otherwise auto-detected from the endpoint URL. |
 | `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it. Legacy alias: `LM_CONTEXT_WINDOW`. |
+| `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:`/`,`-separated allowlist of directory roots `code_task_files` may read from (symlink-resolved). Unset = any absolute path. |
+| `HOUTINI_LM_MAX_FILE_MB` | `10` | Per-file size cap for `code_task_files`. |
+| `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable the cross-process inference lock (serialises inference across agent processes hitting one local model). |
+
+**Per-request sampling** — `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
+
+> **Requires Node ≥ 22.5** (≥ 22.13 recommended) — the model cache uses Node's built-in `node:sqlite`. On older Node the server still runs, without the cache.
 
 ## Compatible endpoints
 

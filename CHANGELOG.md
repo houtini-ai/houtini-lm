@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.1.0] - 2026-07-17
+
+### Added
+- **Per-request sampling controls** on `chat`, `custom_prompt`, `code_task`, `code_task_files`: `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty`. All are range-validated server-side and forwarded only when set (unknown fields are ignored by backends that don't support them). `seed` gives reproducible output for testing.
+- **Prefix-cache telemetry** — `usage.prompt_tokens_details.cached_tokens` (KV-reuse hits) is now captured and surfaced in the footer, a strong "this delegation was nearly free" signal when re-sending shared context.
+- **`content_filter` finish-reason** is flagged distinctly in the quality line — a refusal, not a length truncation, so the orchestrator handles it differently.
+
+### Fixed
+- **`json_schema`** now accepts both the documented wrapper `{name, schema, strict}` and a bare JSON Schema; a bare schema previously produced `undefined` name/schema and silently unconstrained output.
+- **`max_tokens` / `temperature`** are range-validated before reaching the upstream request.
+- **Prefill estimator** derives its ratio fallback from the same per-call `(prompt_tokens, ttft)` samples as the linear fit, instead of mixing populations (which skewed the rate and could mis-fire the pre-flight refusal).
+
+## [3.0.0] - 2026-07-17
+
+**Breaking:** minimum Node is now **>=22.5** (recommended **>=22.13**), for `node:sqlite`.
+
+### Changed
+- **Model cache migrated from sql.js to `node:sqlite`** (Node's built-in SQLite) in WAL mode. Multiple houtini-lm processes sharing one cache file now get real cross-process concurrency — per-row writes and proper locking instead of whole-file snapshots — which fixes stats being clobbered under multi-agent fan-out. Still no third-party native dependency, no build step. Existing sql.js databases open unchanged. If `node:sqlite` is unavailable (e.g. Node 22.5–22.12 without `--experimental-sqlite`), the cache is disabled and the server runs without persistence rather than crashing.
+
+### Added
+- **Cross-process inference lock** — an advisory file lock serialises inference across processes on the same machine (opt out with `HOUTINI_LM_CROSS_PROCESS_LOCK=0`), so multiple agents don't hammer one loaded model in parallel. Fail-open: never blocks a call indefinitely.
+- **`code_task_files` read guards** — per-file size cap (`HOUTINI_LM_MAX_FILE_MB`, default 10) and optional root confinement (`HOUTINI_LM_FILE_ROOTS`, symlink-resolved).
+
+### Fixed
+- Mid-stream backend `error` events are surfaced instead of returned as a silent empty success; per-token progress notifications are time-throttled so a fast model can't flood stdio; `tok/s` is measured over the decode window (excludes prefill); `discover` reports "no model loaded" instead of presenting an unloaded model as active; the `stats` tool no longer crashes when called with no arguments; endpoint URLs are redacted before display. See docs/CODE-REVIEW-2026-07.md and docs/AUDIT-2026-07.md for the full list.
+
 ## [2.13.2] - 2026-04-21
 
 ### Fixed

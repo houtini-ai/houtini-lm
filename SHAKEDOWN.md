@@ -14,7 +14,7 @@ run it:
    report at the end. Useful when you want a human-readable quality review, not
    just latency numbers.
 
-Both modes exercise the same seven tools in the same order. The conversational
+Both modes exercise the same seven tools (all eight except `stats`) in the same order. The conversational
 version additionally evaluates output quality — did the JSON conform to the
 schema, are the tests usable, did cross-file review actually cross-reference.
 The automated script only checks shape (valid JSON, code-like content,
