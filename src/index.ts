@@ -6,6 +6,11 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
+// Must be first: registers the node:sqlite experimental-warning filter BEFORE
+// the model-cache import (which pulls in node:sqlite and would emit the warning
+// at import time, i.e. before any later-registered handler could catch it).
+import './suppress-experimental-warnings.js';
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -1988,7 +1993,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.13.2' },
+  { name: 'houtini-lm', version: '3.0.0' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
