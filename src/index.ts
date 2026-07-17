@@ -6,6 +6,11 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
+// Must be first: registers the node:sqlite experimental-warning filter BEFORE
+// the model-cache import (which pulls in node:sqlite and would emit the warning
+// at import time, i.e. before any later-registered handler could catch it).
+import './suppress-experimental-warnings.js';
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {

@@ -127,7 +127,7 @@ Available models (downloaded, not loaded):
     HuggingFace: text-generation, 12.9K downloads, Apache-2.0
 ```
 
-For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's a curated profile built in with specific strengths and weaknesses. For everything else, the HuggingFace lookup fills the gaps. Cache refreshes every 7 days. Zero friction - `sql.js` is pure WASM, no native dependencies, no build tools needed.
+For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's a curated profile built in with specific strengths and weaknesses. For everything else, the HuggingFace lookup fills the gaps. Cache refreshes every 7 days. Zero friction - the cache uses `node:sqlite` (Node's built-in SQLite, so no third-party native dependency and no build tools) in WAL mode, which lets several houtini-lm processes share one cache safely. Requires Node ≥ 22.5.
 
 ## What gets offloaded
 
@@ -475,7 +475,7 @@ If the connection stalls (no new tokens for an extended period), you get a parti
 
 ```
 index.ts          Main MCP server - tools, streaming, session tracking
-model-cache.ts    SQLite-backed model profile cache (sql.js / WASM)
+model-cache.ts    SQLite-backed model profile cache (node:sqlite, WAL)
                   Auto-profiles models via HuggingFace API at startup
                   Persists to ~/.houtini-lm/model-cache.db
 

@@ -5,11 +5,15 @@
  * looks up each one on HuggingFace's free API. The results are cached in a
  * local SQLite database so subsequent startups are instant (no network).
  *
- * Uses sql.js (pure WASM) — zero native deps, works everywhere.
+ * Uses node:sqlite (Node's built-in SQLite, Node >=22.5) in WAL mode, so
+ * multiple houtini-lm processes sharing this file get real cross-process
+ * concurrency — per-row writes and proper locking instead of whole-file
+ * snapshots. Built into Node, so no third-party native dependency and no build
+ * step. Existing sql.js databases are standard SQLite and open unchanged.
  */
 
-import initSqlJs, { type Database } from 'sql.js';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -191,49 +195,60 @@ const HF_TIMEOUT_MS = 8000;
 
 // ── Database ─────────────────────────────────────────────────────────
 
-let db: Database | null = null;
-let initPromise: Promise<Database> | null = null;
+let db: DatabaseSync | null = null;
 
-export async function initDb(): Promise<Database> {
+/**
+ * Open (or create) the on-disk SQLite database. node:sqlite construction is
+ * synchronous and the connection persists writes directly, so there's no
+ * whole-file snapshot to serialise and no init race across the await gap — the
+ * old sql.js `saveDb()`/`scheduleSave()` machinery is gone. WAL mode plus a
+ * busy_timeout give multiple processes safe concurrent access to one file.
+ * Kept async so existing `await initDb()` callers don't change.
+ */
+export async function initDb(): Promise<DatabaseSync> {
   if (db) return db;
-  // Guard against concurrent first callers (e.g. hydrateLifetimeFromDb and
-  // profileModelsAtStartup fired without awaiting): without this both would
-  // pass the `if (db)` check, build separate Database instances, and the later
-  // assignment would orphan the earlier instance's writes. Cache the in-flight
-  // promise so every caller awaits the same initialisation.
-  if (initPromise) return initPromise;
-  initPromise = (async () => {
-    const database = await doInitDb();
-    db = database;
-    return database;
-  })();
-  try {
-    return await initPromise;
-  } finally {
-    initPromise = null;
-  }
+  db = doInitDb();
+  return db;
 }
 
-async function doInitDb(): Promise<Database> {
-  const SQL = await initSqlJs();
+function openDb(): DatabaseSync {
+  const database = new DatabaseSync(DB_PATH);
+  // busy_timeout MUST come first: it makes every subsequent locked operation —
+  // including the WAL switch and all writes — wait for the lock instead of
+  // throwing SQLITE_BUSY. Without it, concurrent processes opening the same file
+  // collide on the journal-mode switch. Then enable WAL (persistent once set) so
+  // multiple processes get concurrent readers + a serialised writer.
+  database.exec('PRAGMA busy_timeout = 5000');
+  database.exec('PRAGMA journal_mode = WAL');
+  database.exec('PRAGMA synchronous = NORMAL'); // durable enough for a regenerable cache, much faster
+  return database;
+}
 
-  let database: Database;
-  // Load existing DB from disk if it exists
-  if (existsSync(DB_PATH)) {
-    try {
-      const buf = readFileSync(DB_PATH);
-      database = new SQL.Database(buf);
-    } catch {
-      // Corrupt DB — start fresh
-      database = new SQL.Database();
-    }
-  } else {
-    database = new SQL.Database();
+/** True only for errors that mean the file is genuinely unusable — NOT a
+ *  transient lock/busy, which must never trigger the destructive reset. */
+function isCorruptionError(err: unknown): boolean {
+  return /malformed|not a database|file is encrypted|disk image|out of memory/i.test(String(err));
+}
+
+function doInitDb(): DatabaseSync {
+  mkdirSync(DB_DIR, { recursive: true });
+
+  let database: DatabaseSync;
+  try {
+    database = openDb();
+  } catch (err) {
+    // Only move the file aside for genuine corruption. A "database is locked"
+    // from concurrent access is transient (busy_timeout handles it) and must
+    // NOT destroy another process's data.
+    if (!isCorruptionError(err)) throw err;
+    process.stderr.write(`[houtini-lm] Cache DB corrupt (${err}); starting fresh.\n`);
+    try { renameSync(DB_PATH, `${DB_PATH}.corrupt-${process.pid}`); } catch { /* ignore */ }
+    database = openDb();
   }
   const db = database;
 
   // Create table if not exists
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS model_profiles (
       model_id TEXT PRIMARY KEY,
       hf_id TEXT,
@@ -257,14 +272,14 @@ async function doInitDb(): Promise<Database> {
 
   // Migrate: add thinking columns if upgrading from older schema
   try {
-    db.run('ALTER TABLE model_profiles ADD COLUMN emits_think_blocks INTEGER NOT NULL DEFAULT 0');
+    db.exec('ALTER TABLE model_profiles ADD COLUMN emits_think_blocks INTEGER NOT NULL DEFAULT 0');
   } catch { /* column already exists */ }
   try {
-    db.run('ALTER TABLE model_profiles ADD COLUMN supports_thinking_toggle INTEGER NOT NULL DEFAULT 0');
+    db.exec('ALTER TABLE model_profiles ADD COLUMN supports_thinking_toggle INTEGER NOT NULL DEFAULT 0');
   } catch { /* column already exists */ }
 
   // Per-model performance history — accumulated across sessions.
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS model_performance (
       model_id TEXT PRIMARY KEY,
       total_calls INTEGER NOT NULL DEFAULT 0,
@@ -284,7 +299,7 @@ async function doInitDb(): Promise<Database> {
   // Stores (prompt_tokens, TTFT_ms) pairs so we can fit TTFT ≈ α + β·tokens
   // and separate fixed per-request overhead from real per-token prefill cost.
   // Capped at PREFILL_SAMPLES_PER_MODEL rows per model; oldest pruned on insert.
-  db.run(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS model_prefill_samples (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       model_id TEXT NOT NULL,
@@ -293,116 +308,85 @@ async function doInitDb(): Promise<Database> {
       recorded_at INTEGER NOT NULL
     )
   `);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_prefill_samples_model ON model_prefill_samples(model_id, recorded_at DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_prefill_samples_model ON model_prefill_samples(model_id, recorded_at DESC)`);
 
   return db;
 }
 
-function saveDb(): void {
-  if (!db) return;
-  try {
-    mkdirSync(DB_DIR, { recursive: true });
-    const data = db.export();
-    // Atomic write: serialise to a per-process temp file, then rename over the
-    // real path. rename() is atomic on the same filesystem, so a crash or a
-    // concurrent reader never sees a half-written DB — which initDb would
-    // otherwise treat as "corrupt" and discard, wiping all lifetime stats.
-    const tmpPath = `${DB_PATH}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, Buffer.from(data));
-    renameSync(tmpPath, DB_PATH);
-  } catch (err) {
-    process.stderr.write(`[houtini-lm] Failed to save model cache: ${err}\n`);
-  }
+/** Coerce a JS value to something node:sqlite accepts as a bound parameter. */
+function p(v: unknown): null | number | bigint | string | Uint8Array {
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  return v as number | bigint | string | Uint8Array;
 }
 
-// Coalesce the DB writes from a single inference call. recordUsage fires both
-// recordPerformance and recordPrefillSample per call, each of which used to
-// serialise and rewrite the entire DB — two full-file writes per response.
-// scheduleSave collapses bursts within a short window into one write. The timer
-// is intentionally NOT unref'd so a clean process exit still flushes it; only a
-// hard kill loses the last (regenerable) window.
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleSave(): void {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    saveDb();
-  }, 200);
+/** Map a model_profiles row to the CachedModelProfile shape. */
+function rowToProfile(row: Record<string, unknown>): CachedModelProfile {
+  return {
+    modelId: row.model_id as string,
+    hfId: row.hf_id as string | null,
+    pipelineTag: row.pipeline_tag as string | null,
+    architectures: row.architectures as string | null,
+    license: row.license as string | null,
+    downloads: row.downloads as number | null,
+    likes: row.likes as number | null,
+    libraryName: row.library_name as string | null,
+    family: row.family as string | null,
+    description: row.description as string | null,
+    strengths: row.strengths as string | null,
+    weaknesses: row.weaknesses as string | null,
+    bestFor: row.best_for as string | null,
+    emitsThinkBlocks: !!(row.emits_think_blocks as number),
+    supportsThinkingToggle: !!(row.supports_thinking_toggle as number),
+    fetchedAt: row.fetched_at as number,
+    source: row.source as 'huggingface' | 'static' | 'inferred',
+  };
 }
 
 // ── Cache operations ─────────────────────────────────────────────────
 
 export async function getCachedProfile(modelId: string): Promise<CachedModelProfile | null> {
   const database = await initDb();
-  const stmt = database.prepare('SELECT * FROM model_profiles WHERE model_id = ?');
-  try {
-    stmt.bind([modelId]);
-
-    if (stmt.step()) {
-      const row = stmt.getAsObject() as Record<string, unknown>;
-      return {
-        modelId: row.model_id as string,
-        hfId: row.hf_id as string | null,
-        pipelineTag: row.pipeline_tag as string | null,
-        architectures: row.architectures as string | null,
-        license: row.license as string | null,
-        downloads: row.downloads as number | null,
-        likes: row.likes as number | null,
-        libraryName: row.library_name as string | null,
-        family: row.family as string | null,
-        description: row.description as string | null,
-        strengths: row.strengths as string | null,
-        weaknesses: row.weaknesses as string | null,
-        bestFor: row.best_for as string | null,
-        emitsThinkBlocks: !!(row.emits_think_blocks as number),
-        supportsThinkingToggle: !!(row.supports_thinking_toggle as number),
-        fetchedAt: row.fetched_at as number,
-        source: row.source as 'huggingface' | 'static' | 'inferred',
-      };
-    }
-    return null;
-  } finally {
-    stmt.free();
-  }
+  const row = database.prepare('SELECT * FROM model_profiles WHERE model_id = ?').get(modelId) as Record<string, unknown> | undefined;
+  return row ? rowToProfile(row) : null;
 }
 
 /**
- * Insert or update a profile in the DB. Saves to disk immediately by default.
- * Pass skipSave=true during batch operations, then call flushDb() when done.
+ * Insert or update a profile in the DB. node:sqlite persists the write directly,
+ * so there's no separate save step. `skipSave` is retained for call-site
+ * compatibility but is now a no-op (as is flushDb).
  */
-export async function upsertProfile(profile: CachedModelProfile, skipSave = false): Promise<void> {
+export async function upsertProfile(profile: CachedModelProfile, _skipSave = false): Promise<void> {
   const database = await initDb();
-  database.run(
+  database.prepare(
     `INSERT OR REPLACE INTO model_profiles
      (model_id, hf_id, pipeline_tag, architectures, license, downloads, likes, library_name,
       family, description, strengths, weaknesses, best_for, emits_think_blocks, supports_thinking_toggle, fetched_at, source)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      profile.modelId,
-      profile.hfId,
-      profile.pipelineTag,
-      profile.architectures,
-      profile.license,
-      profile.downloads,
-      profile.likes,
-      profile.libraryName,
-      profile.family,
-      profile.description,
-      profile.strengths,
-      profile.weaknesses,
-      profile.bestFor,
-      profile.emitsThinkBlocks ? 1 : 0,
-      profile.supportsThinkingToggle ? 1 : 0,
-      profile.fetchedAt,
-      profile.source,
-    ],
+  ).run(
+    p(profile.modelId),
+    p(profile.hfId),
+    p(profile.pipelineTag),
+    p(profile.architectures),
+    p(profile.license),
+    p(profile.downloads),
+    p(profile.likes),
+    p(profile.libraryName),
+    p(profile.family),
+    p(profile.description),
+    p(profile.strengths),
+    p(profile.weaknesses),
+    p(profile.bestFor),
+    profile.emitsThinkBlocks ? 1 : 0,
+    profile.supportsThinkingToggle ? 1 : 0,
+    p(profile.fetchedAt),
+    p(profile.source),
   );
-  if (!skipSave) saveDb();
 }
 
-/** Flush DB to disk. Call after batch upsertProfile(…, true) operations. */
+/** No-op — node:sqlite persists writes directly. Retained for compatibility. */
 export function flushDb(): void {
-  saveDb();
+  /* writes are persisted immediately by node:sqlite */
 }
 
 export function isCacheStale(profile: CachedModelProfile): boolean {
@@ -794,32 +778,8 @@ export async function getHFEnrichmentLine(modelId: string): Promise<string> {
  */
 export async function getAllCachedProfiles(): Promise<CachedModelProfile[]> {
   const database = await initDb();
-  const results: CachedModelProfile[] = [];
-  const stmt = database.prepare('SELECT * FROM model_profiles ORDER BY model_id');
-  while (stmt.step()) {
-    const row = stmt.getAsObject() as Record<string, unknown>;
-    results.push({
-      modelId: row.model_id as string,
-      hfId: row.hf_id as string | null,
-      pipelineTag: row.pipeline_tag as string | null,
-      architectures: row.architectures as string | null,
-      license: row.license as string | null,
-      downloads: row.downloads as number | null,
-      likes: row.likes as number | null,
-      libraryName: row.library_name as string | null,
-      family: row.family as string | null,
-      description: row.description as string | null,
-      strengths: row.strengths as string | null,
-      weaknesses: row.weaknesses as string | null,
-      bestFor: row.best_for as string | null,
-      emitsThinkBlocks: !!(row.emits_think_blocks as number),
-      supportsThinkingToggle: !!(row.supports_thinking_toggle as number),
-      fetchedAt: row.fetched_at as number,
-      source: row.source as 'huggingface' | 'static' | 'inferred',
-    });
-  }
-  stmt.free();
-  return results;
+  const rows = database.prepare('SELECT * FROM model_profiles ORDER BY model_id').all() as Record<string, unknown>[];
+  return rows.map(rowToProfile);
 }
 
 /**
@@ -881,16 +841,8 @@ function rowToPerformance(row: Record<string, unknown>): CachedPerformance {
 export async function getPerformance(modelId: string): Promise<CachedPerformance | null> {
   if (!modelId) return null;
   const database = await initDb();
-  const stmt = database.prepare('SELECT * FROM model_performance WHERE model_id = ?');
-  try {
-    stmt.bind([modelId]);
-    if (stmt.step()) {
-      return rowToPerformance(stmt.getAsObject() as Record<string, unknown>);
-    }
-    return null;
-  } finally {
-    stmt.free();
-  }
+  const row = database.prepare('SELECT * FROM model_performance WHERE model_id = ?').get(modelId) as Record<string, unknown> | undefined;
+  return row ? rowToPerformance(row) : null;
 }
 
 /**
@@ -899,16 +851,8 @@ export async function getPerformance(modelId: string): Promise<CachedPerformance
  */
 export async function getAllPerformance(): Promise<CachedPerformance[]> {
   const database = await initDb();
-  const stmt = database.prepare('SELECT * FROM model_performance ORDER BY last_used_at DESC');
-  const results: CachedPerformance[] = [];
-  try {
-    while (stmt.step()) {
-      results.push(rowToPerformance(stmt.getAsObject() as Record<string, unknown>));
-    }
-  } finally {
-    stmt.free();
-  }
-  return results;
+  const rows = database.prepare('SELECT * FROM model_performance ORDER BY last_used_at DESC').all() as Record<string, unknown>[];
+  return rows.map(rowToPerformance);
 }
 
 /**
@@ -918,28 +862,21 @@ export async function getAllPerformance(): Promise<CachedPerformance[]> {
  */
 export async function getLifetimeTotals(): Promise<{ totalTokens: number; totalCalls: number; modelsUsed: number; firstSeenAt: number | null }> {
   const database = await initDb();
-  const stmt = database.prepare(`
+  const row = database.prepare(`
     SELECT
       COALESCE(SUM(total_prompt_tokens + total_completion_tokens), 0) AS total_tokens,
       COALESCE(SUM(total_calls), 0) AS total_calls,
       COUNT(*) AS models_used,
       MIN(first_seen_at) AS first_seen_at
     FROM model_performance
-  `);
-  try {
-    if (stmt.step()) {
-      const row = stmt.getAsObject() as Record<string, unknown>;
-      return {
-        totalTokens: (row.total_tokens as number) || 0,
-        totalCalls: (row.total_calls as number) || 0,
-        modelsUsed: (row.models_used as number) || 0,
-        firstSeenAt: (row.first_seen_at as number | null) ?? null,
-      };
-    }
-    return { totalTokens: 0, totalCalls: 0, modelsUsed: 0, firstSeenAt: null };
-  } finally {
-    stmt.free();
-  }
+  `).get() as Record<string, unknown> | undefined;
+  if (!row) return { totalTokens: 0, totalCalls: 0, modelsUsed: 0, firstSeenAt: null };
+  return {
+    totalTokens: (row.total_tokens as number) || 0,
+    totalCalls: (row.total_calls as number) || 0,
+    modelsUsed: (row.models_used as number) || 0,
+    firstSeenAt: (row.first_seen_at as number | null) ?? null,
+  };
 }
 
 /**
@@ -972,7 +909,7 @@ export async function recordPerformance(
   // and two concurrent first-calls both took the INSERT branch and one threw a
   // swallowed UNIQUE violation. `ON CONFLICT DO UPDATE SET col = col + excluded.col`
   // has no read gap and no duplicate-insert failure.
-  database.run(
+  database.prepare(
     `INSERT INTO model_performance (
       model_id, total_calls, ttft_calls, total_ttft_ms, perf_calls, total_tok_per_sec,
       total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
@@ -988,20 +925,18 @@ export async function recordPerformance(
       total_completion_tokens = total_completion_tokens + excluded.total_completion_tokens,
       total_reasoning_tokens = total_reasoning_tokens + excluded.total_reasoning_tokens,
       last_used_at = excluded.last_used_at`,
-    [
-      modelId,
-      ttftCallDelta,
-      ttftDelta,
-      perfCallDelta,
-      perfDelta,
-      opts.promptTokens,
-      opts.completionTokens,
-      reasoningDelta,
-      now,
-      now,
-    ],
+  ).run(
+    p(modelId),
+    ttftCallDelta,
+    ttftDelta,
+    perfCallDelta,
+    perfDelta,
+    p(opts.promptTokens),
+    p(opts.completionTokens),
+    reasoningDelta,
+    now,
+    now,
   );
-  scheduleSave();
 }
 
 // ── Prefill sample collection (linear-fit estimator) ─────────────────
@@ -1038,26 +973,22 @@ export async function recordPrefillSample(
   const database = await initDb();
   const now = Date.now();
 
-  database.run(
+  database.prepare(
     `INSERT INTO model_prefill_samples (model_id, prompt_tokens, ttft_ms, recorded_at)
      VALUES (?, ?, ?, ?)`,
-    [modelId, promptTokens, ttftMs, now],
-  );
+  ).run(p(modelId), promptTokens, ttftMs, now);
 
   // Prune oldest samples beyond the cap for this model.
-  database.run(
+  database.prepare(
     `DELETE FROM model_prefill_samples
      WHERE model_id = ?
        AND id NOT IN (
          SELECT id FROM model_prefill_samples
          WHERE model_id = ?
-         ORDER BY recorded_at DESC
+         ORDER BY recorded_at DESC, id DESC
          LIMIT ?
        )`,
-    [modelId, modelId, PREFILL_SAMPLES_PER_MODEL],
-  );
-
-  scheduleSave();
+  ).run(p(modelId), p(modelId), PREFILL_SAMPLES_PER_MODEL);
 }
 
 /**
@@ -1067,29 +998,19 @@ export async function recordPrefillSample(
 export async function getPrefillSamples(modelId: string, limit: number = PREFILL_SAMPLES_PER_MODEL): Promise<PrefillSample[]> {
   if (!modelId) return [];
   const database = await initDb();
-  const stmt = database.prepare(
+  const rows = database.prepare(
     `SELECT prompt_tokens, ttft_ms, recorded_at
      FROM model_prefill_samples
      WHERE model_id = ?
-     ORDER BY recorded_at DESC
+     ORDER BY recorded_at DESC, id DESC
      LIMIT ?`,
-  );
-  const results: PrefillSample[] = [];
-  try {
-    stmt.bind([modelId, limit]);
-    while (stmt.step()) {
-      const row = stmt.getAsObject() as Record<string, unknown>;
-      results.push({
-        promptTokens: row.prompt_tokens as number,
-        ttftMs: row.ttft_ms as number,
-        recordedAt: row.recorded_at as number,
-      });
-    }
-  } finally {
-    stmt.free();
-  }
+  ).all(p(modelId), limit) as Record<string, unknown>[];
   // Reverse so caller gets oldest-first (monotonic recordedAt).
-  return results.reverse();
+  return rows.map((row) => ({
+    promptTokens: row.prompt_tokens as number,
+    ttftMs: row.ttft_ms as number,
+    recordedAt: row.recorded_at as number,
+  })).reverse();
 }
 
 export interface PrefillFit {
