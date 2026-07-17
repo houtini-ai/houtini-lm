@@ -34,6 +34,7 @@ import {
   fitPrefillLinear,
   type PromptHints,
 } from './model-cache.js';
+import { acquireInferenceLock } from './inference-lock.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
 
@@ -949,6 +950,19 @@ async function chatCompletionStreamingInner(
   // the upstream handshake takes.
   sendProgress('Connecting to model...');
 
+  // Cross-process inference serialisation (local single-model backends only).
+  // Acquire BEFORE the request so only one process at a time drives the model;
+  // the in-process semaphore already gates same-process calls, so this only ever
+  // contends across processes. Keepalive via sendProgress during the wait so a
+  // queued call doesn't sit silent past the client's request timeout. Fail-open:
+  // the lock module returns a no-op release on error or after the wait cap.
+  const releaseInferenceLock = profile.serialiseInference
+    ? await acquireInferenceLock((waitedMs) =>
+        sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`))
+    : () => { /* parallel-friendly backend (e.g. OpenRouter) */ };
+
+  try {
+
   // Pre-fetch heartbeat — keep the client alive while we wait for the
   // upstream LLM to return response headers. Cleared once fetch resolves.
   const preFetchTimer: ReturnType<typeof setInterval> = setInterval(() => {
@@ -1237,6 +1251,10 @@ async function chatCompletionStreamingInner(
     prefillStall,
     streamError,
   };
+
+  } finally {
+    releaseInferenceLock();
+  }
 }
 
 // Backend detection. Probed once on first listModelsRaw() call, cached for
