@@ -1908,7 +1908,8 @@ const TOOLS = [
       '(1) Send COMPLETE context — the local LLM cannot read files.\n' +
       '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
       '(3) Specific system persona beats generic — "Senior TypeScript dev" not "helpful assistant".\n' +
-      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n\n' +
+      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n' +
+      '(5) Leave max_tokens UNSET — the server sizes the budget from the model\'s real context window. Tiny caps like 256 waste the model: reasoning burns the budget before any visible output.\n\n' +
       'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens kept in the user\'s quota.',
     inputSchema: {
       type: 'object' as const,
@@ -1927,7 +1928,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384). Pass a number to cap it tighter for quick answers.',
+          description: 'Response token budget. OMIT THIS — when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. NEVER pass small caps like 256/512/1024: reasoning models spend most of the budget on hidden thinking, so a small cap strangles the visible output while still paying full inference time. Only set this to RAISE the ceiling for very long outputs, and never below 4,096.',
         },
         json_schema: {
           type: 'object',
@@ -1979,7 +1980,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). NEVER pass small caps like 256/512/1024: reasoning models burn the budget on hidden thinking and return strangled output. Only set to RAISE the ceiling, never below 4,096.',
         },
         json_schema: {
           type: 'object',
@@ -2027,7 +2028,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). NEVER pass small caps like 256/512/1024: reasoning models burn the budget on hidden thinking and return strangled output. Only set to RAISE the ceiling, never below 4,096.',
         },
         model: {
           type: 'string',
@@ -2072,7 +2073,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Optional output budget override. Defaults to 25% of the loaded model\'s context window.',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%). NEVER pass small caps like 256/512/1024. Only set to RAISE the ceiling, never below 4,096.',
         },
         model: {
           type: 'string',
