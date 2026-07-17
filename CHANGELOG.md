@@ -12,6 +12,8 @@
 - **`json_schema`** now accepts both the documented wrapper `{name, schema, strict}` and a bare JSON Schema; a bare schema previously produced `undefined` name/schema and silently unconstrained output.
 - **`max_tokens` / `temperature`** are range-validated before reaching the upstream request.
 - **Prefill estimator** derives its ratio fallback from the same per-call `(prompt_tokens, ttft)` samples as the linear fit, instead of mixing populations (which skewed the rate and could mis-fire the pre-flight refusal).
+- **Prefill estimator regime changes** — the linear fit is now recency-weighted (half-life 6 samples), so a backend restart with different performance settings stops poisoning the estimate within a few calls; and a low-confidence fit (R² < 0.5) no longer refuses the call — the keepalive/timeout machinery handles a false-ok, whereas a false refusal blocked valid tiny inputs outright.
+- **Output budget capped to context** — requested/inflated `max_tokens` is clamped to `context − estimated prompt`, fixing a 400 from strict backends (vLLM) when the dynamic 25% budget was then ×4-inflated for thinking models to the full context window. Previously masked by callers passing tiny caps.
 
 ## [3.0.0] - 2026-07-17
 

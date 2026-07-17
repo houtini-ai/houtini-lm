@@ -945,14 +945,32 @@ async function chatCompletionStreamingInner(
 
   // Derive max_tokens from the model's actual context window when not explicitly set.
   // Uses 25% of context as a generous output budget (e.g. 262K context → 65K output).
-  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-  if (!options.maxTokens) {
+  let contextLen: number | undefined;
+  {
     const activeModel = await resolveActive();
-    if (activeModel) {
-      const ctx = getContextLength(activeModel);
-      effectiveMaxTokens = Math.floor(ctx * 0.25);
-    }
+    if (activeModel) contextLen = getContextLength(activeModel);
   }
+  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (!options.maxTokens && contextLen) {
+    effectiveMaxTokens = Math.floor(contextLen * 0.25);
+  }
+
+  // Never request more output than the context window can hold alongside the
+  // prompt — vLLM (and strict OpenAI backends) reject prompt+max_tokens >
+  // context with a 400 instead of clamping. Conservative prompt estimate:
+  // 1 token ≈ 3 chars, plus per-message overhead.
+  const promptChars = messages.reduce(
+    (n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length),
+    0,
+  );
+  const capToContext = (requested: number): number => {
+    if (!contextLen) return requested;
+    const cap = contextLen - (Math.ceil(promptChars / 3) + 64 * messages.length + 512);
+    // If the prompt alone (over)fills the context, don't mangle the request —
+    // let the backend report the real overflow.
+    return cap > 0 ? Math.min(requested, cap) : requested;
+  };
+  effectiveMaxTokens = capToContext(effectiveMaxTokens);
 
   const body: Record<string, unknown> = {
     messages,
@@ -1014,7 +1032,7 @@ async function chatCompletionStreamingInner(
     // guarantee the model generates less of it.
     body.reasoning = { exclude: true };
     const beforeInflation = effectiveMaxTokens;
-    const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+    const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
     body.max_tokens = inflated;
     body.max_completion_tokens = inflated;
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
@@ -1029,7 +1047,7 @@ async function chatCompletionStreamingInner(
       // Inflation uses effectiveMaxTokens (the context-aware value), not
       // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
       const beforeInflation = effectiveMaxTokens;
-      const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+      const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
       process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
@@ -2446,7 +2464,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // avoids the under-prediction a ratio-of-averages produces on inputs
         // much larger than the historical mean.
         const estimate = await estimatePrefill(combined.length, route.modelId);
-        const isConfidentEstimate = estimate.basis === 'linear-fit' || estimate.basis === 'ratio';
+        // A poor fit (low R² — e.g. bimodal samples straddling a backend
+        // restart with different perf settings) must not refuse the call: a
+        // false refusal is worse than a false-ok that the prefill keepalive
+        // and timeout machinery already handle.
+        const isConfidentEstimate =
+          (estimate.basis === 'linear-fit' && estimate.fit!.r2 >= 0.5) ||
+          estimate.basis === 'ratio';
         if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'
