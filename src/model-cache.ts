@@ -12,7 +12,12 @@
  * step. Existing sql.js databases are standard SQLite and open unchanged.
  */
 
-import { DatabaseSync } from 'node:sqlite';
+// Type-only import: erased at compile time so it never triggers a runtime
+// `require('node:sqlite')`. The real module is loaded lazily in initDb via a
+// guarded dynamic import, so a Node build without node:sqlite (e.g. Node
+// 22.5–22.12 without --experimental-sqlite) degrades gracefully instead of
+// hard-crashing the server at startup.
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -195,24 +200,44 @@ const HF_TIMEOUT_MS = 8000;
 
 // ── Database ─────────────────────────────────────────────────────────
 
-let db: DatabaseSync | null = null;
+type DbCtor = new (path: string) => DatabaseSyncType;
+
+let db: DatabaseSyncType | null = null;
+let DatabaseSyncCtor: DbCtor | null = null;
+let cacheDisabled = false;
 
 /**
- * Open (or create) the on-disk SQLite database. node:sqlite construction is
- * synchronous and the connection persists writes directly, so there's no
- * whole-file snapshot to serialise and no init race across the await gap — the
- * old sql.js `saveDb()`/`scheduleSave()` machinery is gone. WAL mode plus a
+ * Open (or create) the on-disk SQLite database. node:sqlite is loaded lazily via
+ * a guarded dynamic import: on a Node build where it's unavailable (e.g. Node
+ * 22.5–22.12 without --experimental-sqlite) the cache is disabled and the server
+ * runs without persistence rather than hard-crashing at startup. Construction is
+ * synchronous and writes persist directly (no snapshot, no init race). WAL +
  * busy_timeout give multiple processes safe concurrent access to one file.
- * Kept async so existing `await initDb()` callers don't change.
+ * Kept async so existing `await initDb()` callers don't change; returns null when
+ * the cache is unavailable — every caller guards on that.
  */
-export async function initDb(): Promise<DatabaseSync> {
+export async function initDb(): Promise<DatabaseSyncType | null> {
   if (db) return db;
-  db = doInitDb();
-  return db;
+  if (cacheDisabled) return null;
+  try {
+    if (!DatabaseSyncCtor) {
+      ({ DatabaseSync: DatabaseSyncCtor } = (await import('node:sqlite')) as unknown as { DatabaseSync: DbCtor });
+    }
+    db = doInitDb(DatabaseSyncCtor);
+    return db;
+  } catch (err) {
+    cacheDisabled = true;
+    process.stderr.write(
+      `[houtini-lm] Model cache disabled — node:sqlite unavailable (${err}). ` +
+      `Upgrade to Node >=22.13, or run with --experimental-sqlite on Node 22.5–22.12. ` +
+      `The server still works; model profiling and cross-session stats are off.\n`,
+    );
+    return null;
+  }
 }
 
-function openDb(): DatabaseSync {
-  const database = new DatabaseSync(DB_PATH);
+function openConnection(Ctor: DbCtor): DatabaseSyncType {
+  const database = new Ctor(DB_PATH);
   // busy_timeout MUST come first: it makes every subsequent locked operation —
   // including the WAL switch and all writes — wait for the lock instead of
   // throwing SQLITE_BUSY. Without it, concurrent processes opening the same file
@@ -230,22 +255,31 @@ function isCorruptionError(err: unknown): boolean {
   return /malformed|not a database|file is encrypted|disk image|out of memory/i.test(String(err));
 }
 
-function doInitDb(): DatabaseSync {
-  mkdirSync(DB_DIR, { recursive: true });
+/** Move the corrupt DB aside — INCLUDING its -wal/-shm sidecars. SQLite
+ *  associates a WAL with a database by filename, so leaving the sidecars would
+ *  make it replay the corrupt frames into the fresh DB. */
+function quarantineDbFiles(): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { renameSync(`${DB_PATH}${suffix}`, `${DB_PATH}${suffix}.corrupt-${process.pid}`); } catch { /* absent — ignore */ }
+  }
+}
 
-  let database: DatabaseSync;
+function doInitDb(Ctor: DbCtor): DatabaseSyncType {
+  mkdirSync(DB_DIR, { recursive: true });
   try {
-    database = openDb();
+    return openAndInit(Ctor);
   } catch (err) {
-    // Only move the file aside for genuine corruption. A "database is locked"
-    // from concurrent access is transient (busy_timeout handles it) and must
-    // NOT destroy another process's data.
+    // Genuine corruption anywhere in open OR schema setup → quarantine and retry
+    // once. A transient lock is not corruption and rethrows untouched.
     if (!isCorruptionError(err)) throw err;
     process.stderr.write(`[houtini-lm] Cache DB corrupt (${err}); starting fresh.\n`);
-    try { renameSync(DB_PATH, `${DB_PATH}.corrupt-${process.pid}`); } catch { /* ignore */ }
-    database = openDb();
+    quarantineDbFiles();
+    return openAndInit(Ctor);
   }
-  const db = database;
+}
+
+function openAndInit(Ctor: DbCtor): DatabaseSyncType {
+  const db = openConnection(Ctor);
 
   // Create table if not exists
   db.exec(`
@@ -347,6 +381,7 @@ function rowToProfile(row: Record<string, unknown>): CachedModelProfile {
 
 export async function getCachedProfile(modelId: string): Promise<CachedModelProfile | null> {
   const database = await initDb();
+  if (!database) return null;
   const row = database.prepare('SELECT * FROM model_profiles WHERE model_id = ?').get(modelId) as Record<string, unknown> | undefined;
   return row ? rowToProfile(row) : null;
 }
@@ -358,6 +393,7 @@ export async function getCachedProfile(modelId: string): Promise<CachedModelProf
  */
 export async function upsertProfile(profile: CachedModelProfile, _skipSave = false): Promise<void> {
   const database = await initDb();
+  if (!database) return;
   database.prepare(
     `INSERT OR REPLACE INTO model_profiles
      (model_id, hf_id, pipeline_tag, architectures, license, downloads, likes, library_name,
@@ -550,6 +586,21 @@ async function lookupHF(modelId: string, publisher?: string): Promise<HFModelCar
 // When HF gives us metadata but we don't have a hardcoded profile,
 // generate a reasonable one from the available data.
 
+/**
+ * Strip control chars / newlines and cap length on free-text HuggingFace card
+ * fields before they're stored and later rendered into tool output. A squatted
+ * model card (matching a local model id) could otherwise plant multi-line
+ * "SYSTEM: …" text that reads as trusted server metadata in discover/list_models.
+ */
+function sanitizeCardText(s: string | null | undefined, maxLen = 80): string | null {
+  if (!s) return null;
+  // Collapse control chars (incl. newlines) and whitespace runs to one space,
+  // then cap length, so a card can't inject multi-line instructions.
+  const oneLine = String(s).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!oneLine) return null;
+  return oneLine.length > maxLen ? oneLine.slice(0, maxLen) + '\u2026' : oneLine;
+}
+
 function inferProfileFromHF(card: HFModelCard, modelId: string): Partial<CachedModelProfile> {
   const tag = card.pipeline_tag || '';
   const tags = card.tags || [];
@@ -568,7 +619,8 @@ function inferProfileFromHF(card: HFModelCard, modelId: string): Partial<CachedM
   if (tag === 'text-generation') description += ' Text generation / chat model.';
   else if (tag === 'image-text-to-text') description += ' Vision-language model — handles text and image inputs.';
   else if (tag === 'feature-extraction' || tag === 'sentence-similarity') description += ' Embedding model for semantic search.';
-  if (card.cardData?.license) description += ` License: ${card.cardData.license}.`;
+  const safeLicense = sanitizeCardText(card.cardData?.license, 40);
+  if (safeLicense) description += ` License: ${safeLicense}.`;
 
   // Infer strengths from tags
   const strengths: string[] = [];
@@ -673,6 +725,7 @@ interface ModelInfoForCache {
  */
 export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promise<void> {
   const database = await initDb();
+  if (!database) return;
   let profiledCount = 0;
   let cachedCount = 0;
 
@@ -695,7 +748,7 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           hfId: card.id,
           pipelineTag: card.pipeline_tag || null,
           architectures: card.config?.architectures ? JSON.stringify(card.config.architectures) : null,
-          license: card.cardData?.license || null,
+          license: sanitizeCardText(card.cardData?.license, 40),
           downloads: card.downloads || null,
           likes: card.likes || null,
           libraryName: card.library_name || null,
@@ -778,6 +831,7 @@ export async function getHFEnrichmentLine(modelId: string): Promise<string> {
  */
 export async function getAllCachedProfiles(): Promise<CachedModelProfile[]> {
   const database = await initDb();
+  if (!database) return [];
   const rows = database.prepare('SELECT * FROM model_profiles ORDER BY model_id').all() as Record<string, unknown>[];
   return rows.map(rowToProfile);
 }
@@ -841,6 +895,7 @@ function rowToPerformance(row: Record<string, unknown>): CachedPerformance {
 export async function getPerformance(modelId: string): Promise<CachedPerformance | null> {
   if (!modelId) return null;
   const database = await initDb();
+  if (!database) return null;
   const row = database.prepare('SELECT * FROM model_performance WHERE model_id = ?').get(modelId) as Record<string, unknown> | undefined;
   return row ? rowToPerformance(row) : null;
 }
@@ -851,6 +906,7 @@ export async function getPerformance(modelId: string): Promise<CachedPerformance
  */
 export async function getAllPerformance(): Promise<CachedPerformance[]> {
   const database = await initDb();
+  if (!database) return [];
   const rows = database.prepare('SELECT * FROM model_performance ORDER BY last_used_at DESC').all() as Record<string, unknown>[];
   return rows.map(rowToPerformance);
 }
@@ -862,6 +918,7 @@ export async function getAllPerformance(): Promise<CachedPerformance[]> {
  */
 export async function getLifetimeTotals(): Promise<{ totalTokens: number; totalCalls: number; modelsUsed: number; firstSeenAt: number | null }> {
   const database = await initDb();
+  if (!database) return { totalTokens: 0, totalCalls: 0, modelsUsed: 0, firstSeenAt: null };
   const row = database.prepare(`
     SELECT
       COALESCE(SUM(total_prompt_tokens + total_completion_tokens), 0) AS total_tokens,
@@ -896,6 +953,7 @@ export async function recordPerformance(
 ): Promise<void> {
   if (!modelId) return;
   const database = await initDb();
+  if (!database) return;
   const now = Date.now();
   const ttftDelta = opts.ttftMs && opts.ttftMs > 0 ? opts.ttftMs : 0;
   const ttftCallDelta = ttftDelta > 0 ? 1 : 0;
@@ -971,6 +1029,7 @@ export async function recordPrefillSample(
 ): Promise<void> {
   if (!modelId || promptTokens <= 0 || ttftMs <= 0) return;
   const database = await initDb();
+  if (!database) return;
   const now = Date.now();
 
   database.prepare(
@@ -998,6 +1057,7 @@ export async function recordPrefillSample(
 export async function getPrefillSamples(modelId: string, limit: number = PREFILL_SAMPLES_PER_MODEL): Promise<PrefillSample[]> {
   if (!modelId) return [];
   const database = await initDb();
+  if (!database) return [];
   const rows = database.prepare(
     `SELECT prompt_tokens, ttft_ms, recorded_at
      FROM model_prefill_samples
