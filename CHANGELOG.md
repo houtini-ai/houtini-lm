@@ -6,6 +6,7 @@
 - **Per-request sampling controls** on `chat`, `custom_prompt`, `code_task`, `code_task_files`: `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty`. All are range-validated server-side and forwarded only when set (unknown fields are ignored by backends that don't support them). `seed` gives reproducible output for testing.
 - **Prefix-cache telemetry** — `usage.prompt_tokens_details.cached_tokens` (KV-reuse hits) is now captured and surfaced in the footer, a strong "this delegation was nearly free" signal when re-sending shared context.
 - **`content_filter` finish-reason** is flagged distinctly in the quality line — a refusal, not a length truncation, so the orchestrator handles it differently.
+- **`max_tokens` floor** (`HOUTINI_LM_MIN_TOKENS`, default 4096) — caller-supplied budgets below the floor are ignored and the dynamic 25%-of-context budget applies instead. MCP clients habitually pass tiny caps like 256 that strangle reasoning models (hidden thinking burns the budget before any visible output). Set `HOUTINI_LM_MIN_TOKENS=0` to honour any value, e.g. deliberate micro-chunking on slow hardware. Tool schema descriptions rewritten to match.
 
 ### Fixed
 - **`json_schema`** now accepts both the documented wrapper `{name, schema, strict}` and a bare JSON Schema; a bare schema previously produced `undefined` name/schema and silently unconstrained output.

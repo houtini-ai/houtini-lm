@@ -851,10 +851,29 @@ function validTemperature(v: unknown): number | undefined {
   return Number.isFinite(n) && n >= 0 && n <= 2 ? n : undefined;
 }
 
+/**
+ * Minimum caller-supplied max_tokens the server will honour. Values below this
+ * are discarded so the dynamic context-based budget (25% of the model's context
+ * window) applies instead — MCP clients habitually pass tiny caps like 256 that
+ * strangle reasoning models. Set HOUTINI_LM_MIN_TOKENS=0 to honour any value
+ * (e.g. deliberate micro-chunking on slow hardware), or a different floor.
+ */
+const MIN_MAX_TOKENS = (() => {
+  const v = Number(process.env.HOUTINI_LM_MIN_TOKENS);
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4096;
+})();
+
 /** Clamp a caller-supplied max_tokens to a positive sane range, or undefined. */
 function validMaxTokens(v: unknown): number | undefined {
   const n = typeof v === 'number' ? v : NaN;
-  return Number.isInteger(n) && n > 0 && n <= 1_000_000 ? n : undefined;
+  if (!Number.isInteger(n) || n <= 0 || n > 1_000_000) return undefined;
+  if (n < MIN_MAX_TOKENS) {
+    process.stderr.write(
+      `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor — ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
+    );
+    return undefined;
+  }
+  return n;
 }
 
 /**
@@ -1928,7 +1947,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. NEVER pass small caps like 256/512/1024: reasoning models spend most of the budget on hidden thinking, so a small cap strangles the visible output while still paying full inference time. Only set this to RAISE the ceiling for very long outputs, and never below 4,096.',
+          description: 'Response token budget. OMIT THIS — when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. Small caps like 256/512/1024 strangle reasoning models (hidden thinking burns the budget before visible output), so values below 4,096 are IGNORED and the dynamic budget applies. Only set this to raise the ceiling for very long outputs.',
         },
         json_schema: {
           type: 'object',
@@ -1980,7 +1999,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). NEVER pass small caps like 256/512/1024: reasoning models burn the budget on hidden thinking and return strangled output. Only set to RAISE the ceiling, never below 4,096.',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         json_schema: {
           type: 'object',
@@ -2028,7 +2047,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). NEVER pass small caps like 256/512/1024: reasoning models burn the budget on hidden thinking and return strangled output. Only set to RAISE the ceiling, never below 4,096.',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
@@ -2073,7 +2092,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%). NEVER pass small caps like 256/512/1024. Only set to RAISE the ceiling, never below 4,096.',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%). Values below 4,096 are IGNORED and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
