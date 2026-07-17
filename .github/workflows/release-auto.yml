@@ -54,7 +54,7 @@ jobs:
           echo "" >> $GITHUB_OUTPUT
           echo '```bash' >> $GITHUB_OUTPUT
           echo "git clone https://github.com/${{ github.repository }}.git" >> $GITHUB_OUTPUT
-          echo "cd local-llm-mcp" >> $GITHUB_OUTPUT
+          echo "cd houtini-lm" >> $GITHUB_OUTPUT
           echo "npm install" >> $GITHUB_OUTPUT
           echo "npm run build" >> $GITHUB_OUTPUT
           echo '```' >> $GITHUB_OUTPUT

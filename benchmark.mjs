@@ -57,17 +57,9 @@ function tok(text) {
   return Math.ceil((text || '').length / 4);
 }
 
-// Resolve fixtures relative to this repo. Files that live in a *sibling*
-// repo (gemini-mcp) aren't present in a clean checkout — loadFile returns
-// null with a warning so the script never throws before running, and the
-// tasks that depend on them are skipped below.
+// Fixtures resolve relative to this repo, so the benchmark runs on a clean checkout.
 function loadFile(relPath) {
-  try {
-    return readFileSync(join(REPO, relPath), 'utf-8');
-  } catch (err) {
-    console.warn(`  ⚠ Fixture not found, skipping: ${relPath} (${err.code || err.message})`);
-    return null;
-  }
+  return readFileSync(join(REPO, relPath), 'utf-8');
 }
 
 // ── Real source files ────────────────────────────────────────────────
@@ -75,15 +67,10 @@ function loadFile(relPath) {
 const FILES = {
   indexTs: loadFile('src/index.ts'),
   modelCache: loadFile('src/model-cache.ts'),
-  // These originally pointed at a sibling gemini-mcp repo. When that repo
-  // isn't available the associated tasks are skipped gracefully.
-  geminiService: loadFile('src/services/gemini/index.ts'),
-  imagePrompt: loadFile('src/tools/image-prompt-assistant.ts'),
 };
 
 console.log('\nSource files loaded:');
 for (const [name, content] of Object.entries(FILES)) {
-  if (!content) continue;
   const lines = content.split('\n').length;
   console.log(`  ${name}: ${lines} lines, ~${tok(content)} tokens`);
 }
@@ -97,7 +84,7 @@ for (const [name, content] of Object.entries(FILES)) {
 // delegationCost (computed after): overhead + review of local LLM result
 //   The key insight: Claude never reads the source file at all when delegating.
 
-const allTasks = [
+const tasks = [
   // ── Pattern 1: Full file code review (the bread and butter) ────────
   {
     name: 'Code review: index.ts (1352 lines)',
@@ -124,20 +111,7 @@ const allTasks = [
     maxTokens: 1024,
   },
 
-  // ── Pattern 3: Review an unfamiliar codebase ──────────────────────
-  {
-    name: 'Review external repo: gemini service (581 lines)',
-    file: 'geminiService',
-    claudeContextTokens: tok(FILES.geminiService),
-    claudeOutputEstimate: 400,
-    messages: [
-      { role: 'system', content: 'Senior TypeScript reviewer. You are reviewing code you have never seen before. Identify: error handling gaps, potential crashes, resource leaks, API misuse. Max 8 bullet points, reference function names.' },
-      { role: 'user', content: `Review this Gemini API service for issues:\n\n\`\`\`typescript\n${FILES.geminiService}\n\`\`\`` },
-    ],
-    maxTokens: 1024,
-  },
-
-  // ── Pattern 4: Generate test stubs for a real file ────────────────
+  // ── Pattern 3: Generate test stubs for a real file ────────────────
   {
     name: 'Generate test stubs: model-cache.ts (670 lines)',
     file: 'modelCache',
@@ -150,20 +124,7 @@ const allTasks = [
     maxTokens: 2048,
   },
 
-  // ── Pattern 5: Explain unfamiliar code ────────────────────────────
-  {
-    name: 'Explain code: image-prompt-assistant (833 lines)',
-    file: 'imagePrompt',
-    claudeContextTokens: tok(FILES.imagePrompt),
-    claudeOutputEstimate: 500,
-    messages: [
-      { role: 'system', content: 'Technical writer explaining code to a developer joining the project. Cover: purpose, main functions, data flow, key design decisions. Use headings and bullet points. Max 500 words.' },
-      { role: 'user', content: `Explain this module:\n\n\`\`\`typescript\n${FILES.imagePrompt}\n\`\`\`` },
-    ],
-    maxTokens: 1024,
-  },
-
-  // ── Pattern 6: Extract types / API surface ────────────────────────
+  // ── Pattern 4: Extract types / API surface ────────────────────────
   {
     name: 'Extract API surface: index.ts → type definitions',
     file: 'indexTs',
@@ -176,17 +137,6 @@ const allTasks = [
     maxTokens: 1024,
   },
 ];
-
-// Skip any task whose source fixture(s) aren't present in this checkout
-// (e.g. the sibling gemini-mcp files) instead of sending "null" to the model.
-const tasks = allTasks.filter((task) => {
-  const missing = task.file.split('+').filter((key) => !FILES[key]);
-  if (missing.length) {
-    console.log(`  ⚠ Skipping "${task.name}" — missing fixture(s): ${missing.join(', ')}`);
-    return false;
-  }
-  return true;
-});
 
 // ── Run benchmark ────────────────────────────────────────────────────
 
