@@ -19,7 +19,7 @@ test.mjs              Direct-client integration tests (hits /v1 endpoints)
 test-mcp-e2e.mjs      End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
 benchmark.mjs         Throughput + savings benchmark
-shakedown.mjs         End-to-end self-test — runs all 7 tools in sequence
+shakedown.mjs         End-to-end self-test — runs 7 of the 8 tools in sequence (all except stats)
 SHAKEDOWN.md          Canonical test prompt (for running via Claude chat)
 add-shebang.mjs       Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
@@ -329,7 +329,7 @@ Four independent test harnesses, each with a different scope:
   override.
 - **`benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs all 7 tools end-to-end and prints a summary table with TTFT, tok/s,
+  Runs 7 of the 8 tools end-to-end (all except `stats`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
 

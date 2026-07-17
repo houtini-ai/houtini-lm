@@ -9,7 +9,7 @@
  */
 
 import initSqlJs, { type Database } from 'sql.js';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -192,24 +192,45 @@ const HF_TIMEOUT_MS = 8000;
 // ── Database ─────────────────────────────────────────────────────────
 
 let db: Database | null = null;
+let initPromise: Promise<Database> | null = null;
 
 export async function initDb(): Promise<Database> {
   if (db) return db;
+  // Guard against concurrent first callers (e.g. hydrateLifetimeFromDb and
+  // profileModelsAtStartup fired without awaiting): without this both would
+  // pass the `if (db)` check, build separate Database instances, and the later
+  // assignment would orphan the earlier instance's writes. Cache the in-flight
+  // promise so every caller awaits the same initialisation.
+  if (initPromise) return initPromise;
+  initPromise = (async () => {
+    const database = await doInitDb();
+    db = database;
+    return database;
+  })();
+  try {
+    return await initPromise;
+  } finally {
+    initPromise = null;
+  }
+}
 
+async function doInitDb(): Promise<Database> {
   const SQL = await initSqlJs();
 
+  let database: Database;
   // Load existing DB from disk if it exists
   if (existsSync(DB_PATH)) {
     try {
       const buf = readFileSync(DB_PATH);
-      db = new SQL.Database(buf);
+      database = new SQL.Database(buf);
     } catch {
       // Corrupt DB — start fresh
-      db = new SQL.Database();
+      database = new SQL.Database();
     }
   } else {
-    db = new SQL.Database();
+    database = new SQL.Database();
   }
+  const db = database;
 
   // Create table if not exists
   db.run(`
@@ -282,10 +303,31 @@ function saveDb(): void {
   try {
     mkdirSync(DB_DIR, { recursive: true });
     const data = db.export();
-    writeFileSync(DB_PATH, Buffer.from(data));
+    // Atomic write: serialise to a per-process temp file, then rename over the
+    // real path. rename() is atomic on the same filesystem, so a crash or a
+    // concurrent reader never sees a half-written DB — which initDb would
+    // otherwise treat as "corrupt" and discard, wiping all lifetime stats.
+    const tmpPath = `${DB_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, Buffer.from(data));
+    renameSync(tmpPath, DB_PATH);
   } catch (err) {
     process.stderr.write(`[houtini-lm] Failed to save model cache: ${err}\n`);
   }
+}
+
+// Coalesce the DB writes from a single inference call. recordUsage fires both
+// recordPerformance and recordPrefillSample per call, each of which used to
+// serialise and rewrite the entire DB — two full-file writes per response.
+// scheduleSave collapses bursts within a short window into one write. The timer
+// is intentionally NOT unref'd so a clean process exit still flushes it; only a
+// hard kill loses the last (regenerable) window.
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSave(): void {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveDb();
+  }, 200);
 }
 
 // ── Cache operations ─────────────────────────────────────────────────
@@ -924,56 +966,42 @@ export async function recordPerformance(
   const perfCallDelta = perfDelta > 0 ? 1 : 0;
   const reasoningDelta = opts.reasoningTokens ?? 0;
 
-  const existing = await getPerformance(modelId);
-
-  if (existing) {
-    database.run(
-      `UPDATE model_performance SET
-        total_calls = ?,
-        ttft_calls = ?,
-        total_ttft_ms = ?,
-        perf_calls = ?,
-        total_tok_per_sec = ?,
-        total_prompt_tokens = ?,
-        total_completion_tokens = ?,
-        total_reasoning_tokens = ?,
-        last_used_at = ?
-      WHERE model_id = ?`,
-      [
-        existing.totalCalls + 1,
-        existing.ttftCalls + ttftCallDelta,
-        existing.totalTtftMs + ttftDelta,
-        existing.perfCalls + perfCallDelta,
-        existing.totalTokPerSec + perfDelta,
-        existing.totalPromptTokens + opts.promptTokens,
-        existing.totalCompletionTokens + opts.completionTokens,
-        existing.totalReasoningTokens + reasoningDelta,
-        now,
-        modelId,
-      ],
-    );
-  } else {
-    database.run(
-      `INSERT INTO model_performance (
-        model_id, total_calls, ttft_calls, total_ttft_ms, perf_calls, total_tok_per_sec,
-        total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
-        first_seen_at, last_used_at
-      ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        modelId,
-        ttftCallDelta,
-        ttftDelta,
-        perfCallDelta,
-        perfDelta,
-        opts.promptTokens,
-        opts.completionTokens,
-        reasoningDelta,
-        now,
-        now,
-      ],
-    );
-  }
-  saveDb();
+  // Single atomic upsert with relative arithmetic done in SQL. The previous
+  // read-modify-write (SELECT then UPDATE with absolute values) lost updates
+  // when two fire-and-forget calls for the same model raced across the await,
+  // and two concurrent first-calls both took the INSERT branch and one threw a
+  // swallowed UNIQUE violation. `ON CONFLICT DO UPDATE SET col = col + excluded.col`
+  // has no read gap and no duplicate-insert failure.
+  database.run(
+    `INSERT INTO model_performance (
+      model_id, total_calls, ttft_calls, total_ttft_ms, perf_calls, total_tok_per_sec,
+      total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
+      first_seen_at, last_used_at
+    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(model_id) DO UPDATE SET
+      total_calls = total_calls + 1,
+      ttft_calls = ttft_calls + excluded.ttft_calls,
+      total_ttft_ms = total_ttft_ms + excluded.total_ttft_ms,
+      perf_calls = perf_calls + excluded.perf_calls,
+      total_tok_per_sec = total_tok_per_sec + excluded.total_tok_per_sec,
+      total_prompt_tokens = total_prompt_tokens + excluded.total_prompt_tokens,
+      total_completion_tokens = total_completion_tokens + excluded.total_completion_tokens,
+      total_reasoning_tokens = total_reasoning_tokens + excluded.total_reasoning_tokens,
+      last_used_at = excluded.last_used_at`,
+    [
+      modelId,
+      ttftCallDelta,
+      ttftDelta,
+      perfCallDelta,
+      perfDelta,
+      opts.promptTokens,
+      opts.completionTokens,
+      reasoningDelta,
+      now,
+      now,
+    ],
+  );
+  scheduleSave();
 }
 
 // ── Prefill sample collection (linear-fit estimator) ─────────────────
@@ -1029,7 +1057,7 @@ export async function recordPrefillSample(
     [modelId, modelId, PREFILL_SAMPLES_PER_MODEL],
   );
 
-  saveDb();
+  scheduleSave();
 }
 
 /**

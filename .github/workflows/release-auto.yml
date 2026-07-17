@@ -61,8 +61,8 @@ jobs:
           echo "" >> $GITHUB_OUTPUT
           echo "## 📚 Documentation" >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
-          echo "- [Complete Guide](https://github.com/${{ github.repository }}/blob/main/COMPLETE_GUIDE.md)" >> $GITHUB_OUTPUT
-          echo "- [Getting Started](https://github.com/${{ github.repository }}/blob/main/GETTING_STARTED.md)" >> $GITHUB_OUTPUT
+          echo "- [README](https://github.com/${{ github.repository }}/blob/main/README.md)" >> $GITHUB_OUTPUT
+          echo "- [Getting Started](https://github.com/${{ github.repository }}/blob/main/docs/GETTING-STARTED.md)" >> $GITHUB_OUTPUT
         fi
         echo "EOF" >> $GITHUB_OUTPUT
     

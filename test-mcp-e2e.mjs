@@ -86,8 +86,8 @@ try {
   await sleep(500);
 
   console.log('\n=== MCP E2E Smoke Test ===');
-  console.log(`Target: ${process.env.LM_STUDIO_URL}`);
-  console.log(`Model:  ${process.env.LM_STUDIO_MODEL || '(auto)'}\n`);
+  console.log(`Target: ${process.env.HOUTINI_LM_ENDPOINT_URL || process.env.LM_STUDIO_URL || 'http://localhost:1234'}`);
+  console.log(`Model:  ${process.env.HOUTINI_LM_MODEL || process.env.LM_STUDIO_MODEL || '(auto)'}\n`);
 
   await test('list_models returns non-empty set', async () => {
     const res = await callTool('list_models', {});

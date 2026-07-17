@@ -22,8 +22,24 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
+const BASE =
+  process.env.HOUTINI_LM_ENDPOINT_URL ||
+  process.env.LM_STUDIO_URL ||
+  'http://localhost:1234';
+const API_KEY =
+  process.env.HOUTINI_LM_API_KEY ||
+  process.env.LM_STUDIO_PASSWORD ||
+  process.env.LM_PASSWORD ||
+  process.env.OPENROUTER_API_KEY ||
+  '';
 const REPO = dirname(fileURLToPath(import.meta.url));
+
+// Mirrors apiHeaders() in src/index.ts — attach a bearer token when configured.
+function authHeaders(extra = {}) {
+  const h = { ...extra };
+  if (API_KEY) h['Authorization'] = `Bearer ${API_KEY}`;
+  return h;
+}
 
 // ── Backend probe ─────────────────────────────────────────────────────
 // Mirrors the three-endpoint probe in src/index.ts listModelsRaw.
@@ -31,7 +47,7 @@ const REPO = dirname(fileURLToPath(import.meta.url));
 async function detectBackend() {
   // LM Studio /api/v0/models — richest metadata
   try {
-    const res = await fetch(`${BASE}/api/v0/models`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${BASE}/api/v0/models`, { headers: authHeaders(), signal: AbortSignal.timeout(5000) });
     if (res.ok) {
       const data = await res.json();
       return { backend: 'LM Studio', models: data.data };
@@ -40,7 +56,7 @@ async function detectBackend() {
 
   // Ollama /api/tags
   try {
-    const res = await fetch(`${BASE}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${BASE}/api/tags`, { headers: authHeaders(), signal: AbortSignal.timeout(5000) });
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data.models)) {
@@ -58,7 +74,7 @@ async function detectBackend() {
   } catch { /* fall through */ }
 
   // Generic /v1/models
-  const res = await fetch(`${BASE}/v1/models`, { signal: AbortSignal.timeout(5000) });
+  const res = await fetch(`${BASE}/v1/models`, { headers: authHeaders(), signal: AbortSignal.timeout(5000) });
   if (!res.ok) throw new Error(`Cannot reach ${BASE} — HTTP ${res.status}`);
   const data = await res.json();
   return { backend: 'OpenAI-compatible', models: data.data };
@@ -91,7 +107,7 @@ async function streamingChat({ messages, model, backend, temperature = 0.3, maxT
   const start = Date.now();
   const res = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(300_000),
   });
@@ -400,7 +416,7 @@ export function getContextLength(model: ModelInfo): number {
     try {
       const res = await fetch(`${BASE}/v1/embeddings`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ input: 'Large language models running locally.', model: loadedEmbed.id }),
         signal: AbortSignal.timeout(30_000),
       });
