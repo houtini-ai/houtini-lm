@@ -369,15 +369,28 @@ function apiHeaders(): Record<string, string> {
 
 // ── Request semaphore ────────────────────────────────────────────────
 // Most local LLM servers run a single model and queue parallel requests,
-// which stacks timeouts and wastes the 55s budget. This semaphore ensures
-// only one inference call runs at a time; others wait in line.
+// which stacks timeouts and wastes the budget. This semaphore ensures only one
+// inference call runs at a time; others wait in line.
+
+// Global override: HOUTINI_LM_SERIALISE=0 (or false/no/off) turns OFF inference
+// serialisation entirely — both the in-process semaphore and the cross-process
+// file lock. The right setting for backends that batch requests natively (vLLM,
+// TGI, SGLang), where one-at-a-time only throttles throughput. Default on, which
+// suits a single-model LM Studio / Ollama host contending for one GPU.
+const SERIALISE_INFERENCE = !/^(0|false|no|off)$/i.test(process.env.HOUTINI_LM_SERIALISE || '');
+
+/** Serialise inference for the current backend? Combines the env override with
+ *  the provider profile (OpenRouter and other parallel-friendly backends off). */
+function shouldSerialiseInference(): boolean {
+  return SERIALISE_INFERENCE && getProviderProfile().serialiseInference;
+}
 
 let inferenceLock: Promise<void> = Promise.resolve();
 
 function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Remote providers (OpenRouter etc.) benefit from parallelism and do
-  // their own rate-limit handling; serialising here just throttles us.
-  if (!getProviderProfile().serialiseInference) return fn();
+  // Skip when serialisation is off (env override) or the backend is
+  // parallel-friendly (OpenRouter etc.) — serialising there just throttles us.
+  if (!shouldSerialiseInference()) return fn();
   let release: () => void;
   const next = new Promise<void>((resolve) => { release = resolve; });
   const wait = inferenceLock;
@@ -1054,7 +1067,7 @@ async function chatCompletionStreamingInner(
   // queued call doesn't sit silent past the client's request timeout. Fail-open:
   // the lock module returns a no-op release on error or after the wait cap.
   const canKeepalive = options.progressToken !== undefined;
-  const releaseInferenceLock = profile.serialiseInference
+  const releaseInferenceLock = shouldSerialiseInference()
     ? await acquireInferenceLock({
         onWait: canKeepalive
           ? (waitedMs) => sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`)
