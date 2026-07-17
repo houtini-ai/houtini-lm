@@ -405,6 +405,8 @@ interface StreamingResult {
     total_tokens: number;
     /** OpenAI: how many of the completion tokens were reasoning (hidden) */
     completion_tokens_details?: { reasoning_tokens?: number };
+    /** OpenAI: how many prompt tokens were served from the prefix cache (KV reuse) */
+    prompt_tokens_details?: { cached_tokens?: number };
   };
   finishReason: string;
   truncated: boolean;
@@ -782,9 +784,85 @@ async function timedRead(
  * return whatever content we have so far with `truncated: true`.
  * This means large code reviews return partial results instead of nothing.
  */
+/** Optional per-request sampling controls, passed through to the backend when set. */
+interface SamplingParams {
+  seed?: number;
+  stop?: string | string[];
+  topP?: number;
+  topK?: number;
+  repeatPenalty?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+}
+
+interface InferenceOptions {
+  temperature?: number;
+  maxTokens?: number;
+  model?: string;
+  responseFormat?: ResponseFormat;
+  progressToken?: string | number;
+  sampling?: SamplingParams;
+}
+
+/**
+ * Extract and RANGE-VALIDATE optional sampling params from tool args. Out-of-range,
+ * NaN, or wrong-type values are dropped (undefined) rather than forwarded — the
+ * backend then applies its own default. This also closes the earlier gap where an
+ * unvalidated max_tokens/temperature could reach the upstream request.
+ */
+function extractSamplingParams(args: Record<string, unknown>): SamplingParams {
+  const range = (v: unknown, min: number, max: number): number | undefined => {
+    const n = typeof v === 'number' ? v : NaN;
+    return Number.isFinite(n) && n >= min && n <= max ? n : undefined;
+  };
+  const stopRaw = args.stop;
+  const stop = typeof stopRaw === 'string'
+    ? stopRaw
+    : Array.isArray(stopRaw)
+      ? (stopRaw.filter((s) => typeof s === 'string').slice(0, 4) as string[])
+      : undefined;
+  return {
+    seed: Number.isInteger(args.seed) ? (args.seed as number) : undefined,
+    stop: stop && stop.length ? stop : undefined,
+    topP: range(args.top_p, 0, 1),
+    topK: range(args.top_k, 1, 100_000),
+    repeatPenalty: range(args.repeat_penalty, 0, 2),
+    frequencyPenalty: range(args.frequency_penalty, -2, 2),
+    presencePenalty: range(args.presence_penalty, -2, 2),
+  };
+}
+
+/** Clamp a caller-supplied temperature to a sane range, or undefined if unusable. */
+function validTemperature(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : NaN;
+  return Number.isFinite(n) && n >= 0 && n <= 2 ? n : undefined;
+}
+
+/** Clamp a caller-supplied max_tokens to a positive sane range, or undefined. */
+function validMaxTokens(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : NaN;
+  return Number.isInteger(n) && n > 0 && n <= 1_000_000 ? n : undefined;
+}
+
+/**
+ * Build an OpenAI response_format from the tool's json_schema input. Accepts
+ * BOTH the documented wrapper `{ name, schema, strict }` and a bare JSON Schema
+ * (which the description invites) — the latter previously produced undefined
+ * name/schema and silently unconstrained output.
+ */
+function toResponseFormat(js: unknown): ResponseFormat | undefined {
+  if (!js || typeof js !== 'object') return undefined;
+  const obj = js as Record<string, unknown>;
+  const hasWrapper = !!obj.schema && typeof obj.schema === 'object';
+  const schema = (hasWrapper ? obj.schema : obj) as Record<string, unknown>;
+  const name = hasWrapper && typeof obj.name === 'string' ? obj.name : 'response';
+  const strict = hasWrapper && typeof obj.strict === 'boolean' ? obj.strict : true;
+  return { type: 'json_schema', json_schema: { name, strict, schema } };
+}
+
 async function chatCompletionStreaming(
   messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
+  options: InferenceOptions = {},
 ): Promise<StreamingResult> {
   return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
 }
@@ -815,7 +893,7 @@ async function getActiveModel(): Promise<ModelInfo | null> {
 
 async function chatCompletionStreamingInner(
   messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
+  options: InferenceOptions = {},
 ): Promise<StreamingResult> {
   // Resolve active model once — we use it for both context-aware max_tokens
   // and for auto-injecting the model field when the caller didn't specify one.
@@ -860,6 +938,20 @@ async function chatCompletionStreamingInner(
   }
   if (options.responseFormat) {
     body.response_format = options.responseFormat;
+  }
+
+  // Optional sampling controls — forwarded only when the caller set them (already
+  // range-validated in extractSamplingParams). Backends ignore unknown fields, so
+  // sending e.g. top_k to one that doesn't support it is harmless.
+  const s = options.sampling;
+  if (s) {
+    if (s.seed !== undefined) body.seed = s.seed;
+    if (s.stop !== undefined) body.stop = s.stop;
+    if (s.topP !== undefined) body.top_p = s.topP;
+    if (s.topK !== undefined) body.top_k = s.topK;
+    if (s.repeatPenalty !== undefined) body.repeat_penalty = s.repeatPenalty;
+    if (s.frequencyPenalty !== undefined) body.frequency_penalty = s.frequencyPenalty;
+    if (s.presencePenalty !== undefined) body.presence_penalty = s.presencePenalty;
   }
 
   // Handle thinking/reasoning models.
@@ -1512,7 +1604,11 @@ interface PrefillEstimate {
 async function estimatePrefill(inputChars: number, modelId: string): Promise<PrefillEstimate> {
   const inputTokens = Math.ceil(inputChars / CHARS_PER_TOKEN);
 
-  // 1. Linear fit over recent samples (preferred).
+  // 1. Linear fit over recent samples (preferred); 2. ratio fallback from the
+  // SAME samples when there aren't enough for a fit. Both use the per-call
+  // (promptTokens, ttft) pairs, so the ratio can't mix populations the way the
+  // old aggregate did (avg prompt tokens over all calls vs avg TTFT over only
+  // TTFT-bearing calls), which skewed the rate and mis-fired the refusal guard.
   try {
     const samples = await getPrefillSamples(modelId);
     const fit = fitPrefillLinear(samples);
@@ -1525,24 +1621,21 @@ async function estimatePrefill(inputChars: number, modelId: string): Promise<Pre
         fit,
       };
     }
-  } catch {
-    // Sample fetch failed — fall through to ratio estimator
-  }
-
-  // 2. Ratio fallback — uses aggregate stats already in memory.
-  const stats = lifetime.modelStats.get(modelId);
-  if (stats && stats.ttftCalls >= 2 && stats.totalTtftMs > 0 && stats.totalPromptTokens > 0) {
-    const avgPromptTokens = stats.totalPromptTokens / stats.calls;
-    const avgTtftSec = (stats.totalTtftMs / stats.ttftCalls) / 1000;
-    if (avgTtftSec > 0) {
-      const prefillTokPerSec = avgPromptTokens / avgTtftSec;
-      return {
-        inputTokens,
-        estimatedSeconds: inputTokens / prefillTokPerSec,
-        basis: 'ratio',
-        prefillTokPerSec,
-      };
+    if (samples.length >= 2) {
+      const sumPrompt = samples.reduce((a, s) => a + s.promptTokens, 0);
+      const sumTtftMs = samples.reduce((a, s) => a + s.ttftMs, 0);
+      if (sumPrompt > 0 && sumTtftMs > 0) {
+        const prefillTokPerSec = sumPrompt / (sumTtftMs / 1000);
+        return {
+          inputTokens,
+          estimatedSeconds: inputTokens / prefillTokPerSec,
+          basis: 'ratio',
+          prefillTokPerSec,
+        };
+      }
     }
+  } catch {
+    // Sample fetch failed — fall through to the conservative default.
   }
 
   // 3. Conservative default for unknown model/hardware.
@@ -1686,6 +1779,9 @@ function formatQualityLine(quality: QualitySignal): string {
   else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
   if (quality.estimatedTokens) flags.push('tokens-estimated');
   if (quality.finishReason === 'length') flags.push('hit-max-tokens');
+  // content_filter is a REFUSAL, not a truncation — the orchestrator should
+  // handle it differently (don't retry with a bigger budget). Surface distinctly.
+  if (quality.finishReason === 'content_filter') flags.push('CONTENT-FILTERED (model refused/blocked — not a length cut)');
   if (flags.length === 0) return '';
   return `Quality: ${flags.join(', ')}`;
 }
@@ -1715,6 +1811,12 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
       parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens (${reasoningTokens} reasoning / ${visible} visible)`);
     } else {
       parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+    }
+    // Prefix-cache (KV reuse) hits — a strong "this delegation was nearly free"
+    // signal for the orchestrator when it re-sends shared context.
+    const cached = resp.usage.prompt_tokens_details?.cached_tokens;
+    if (typeof cached === 'number' && cached > 0) {
+      parts.push(`${cached} prompt tokens cached`);
     }
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses where final SSE chunk was lost)
@@ -1763,6 +1865,18 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
 
 // ── MCP Tool definitions ─────────────────────────────────────────────
 
+// Optional sampling controls shared by the inference tools. Out-of-range values
+// are dropped server-side (extractSamplingParams), so the backend default applies.
+const SAMPLING_PROPS = {
+  seed: { type: 'integer', description: 'Deterministic sampling seed — same seed + same prompt → reproducible output. Useful for testing.' },
+  stop: { type: ['string', 'array'], items: { type: 'string' }, description: 'Stop sequence(s) — generation halts when one is produced (up to 4).' },
+  top_p: { type: 'number', description: 'Nucleus sampling 0–1 (e.g. 0.9). Lower = more focused. Alternative to temperature.' },
+  top_k: { type: 'integer', description: 'Sample only from the top-K tokens (e.g. 40). 0/omitted = disabled.' },
+  repeat_penalty: { type: 'number', description: 'Penalise repetition, 0–2 (1 = off, ~1.1 typical).' },
+  frequency_penalty: { type: 'number', description: 'OpenAI-style frequency penalty, -2 to 2.' },
+  presence_penalty: { type: 'number', description: 'OpenAI-style presence penalty, -2 to 2.' },
+} as const;
+
 const TOOLS = [
   {
     name: 'chat',
@@ -1810,6 +1924,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['message'],
     },
@@ -1861,6 +1976,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['instruction'],
     },
@@ -1904,6 +2020,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['code', 'task'],
     },
@@ -1948,6 +2065,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['paths', 'task'],
     },
@@ -2023,7 +2141,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '3.0.0' },
+  { name: 'houtini-lm', version: '3.1.0' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
@@ -2102,9 +2220,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const route = await routeToModel('chat', model);
 
-        const responseFormat: ResponseFormat | undefined = json_schema
-          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
-          : undefined;
+        const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
 
         const messages: ChatMessage[] = [];
         messages.push({
@@ -2119,11 +2235,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         messages.push({ role: 'user', content: message });
 
         const resp = await chatCompletionStreaming(messages, {
-          temperature: temperature ?? route.hints.chatTemp,
-          maxTokens: max_tokens,
+          temperature: validTemperature(temperature) ?? route.hints.chatTemp,
+          maxTokens: validMaxTokens(max_tokens),
           model: route.modelId,
           responseFormat,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const footer = formatFooter(resp);
@@ -2143,9 +2260,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const route = await routeToModel('analysis', model);
 
-        const responseFormat: ResponseFormat | undefined = json_schema
-          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
-          : undefined;
+        const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
 
         const messages: ChatMessage[] = [];
         messages.push({
@@ -2168,11 +2283,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         messages.push({ role: 'user', content: instruction });
 
         const resp = await chatCompletionStreaming(messages, {
-          temperature: temperature ?? route.hints.chatTemp,
-          maxTokens: max_tokens,
+          temperature: validTemperature(temperature) ?? route.hints.chatTemp,
+          maxTokens: validMaxTokens(max_tokens),
           model: route.modelId,
           responseFormat,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const footer = formatFooter(resp);
@@ -2212,14 +2328,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const codeResp = await chatCompletionStreaming(codeMessages, {
           temperature: route.hints.codeTemp,
-          // Pass the raw value (may be undefined) so the 25%-of-context
-          // auto-derivation in chatCompletionStreamingInner fires when the
-          // caller omits max_tokens — matching code_task_files. Forcing
-          // DEFAULT_MAX_TOKENS here made options.maxTokens always truthy,
-          // capping long generations at 16K regardless of the model's context.
-          maxTokens: codeMaxTokens,
+          // Pass the (validated) value, undefined when omitted, so the
+          // 25%-of-context auto-derivation in chatCompletionStreamingInner fires
+          // — matching code_task_files. Forcing DEFAULT_MAX_TOKENS here made
+          // options.maxTokens always truthy, capping long generations at 16K.
+          maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const codeFooter = formatFooter(codeResp, lang);
@@ -2345,9 +2461,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // auto-derivation in chatCompletionStreamingInner fires when the caller omits it.
         const codeResp = await chatCompletionStreaming(codeMessages, {
           temperature: route.hints.codeTemp,
-          maxTokens: codeMaxTokens,
+          maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const readSummary = successCount === paths.length
