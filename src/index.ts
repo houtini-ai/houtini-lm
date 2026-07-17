@@ -36,6 +36,7 @@ import {
 } from './model-cache.js';
 import { acquireInferenceLock } from './inference-lock.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
 
 // Env var naming: HOUTINI_LM_* is the preferred namespace now that we
@@ -78,11 +79,15 @@ const MAX_FILE_BYTES = Math.max(1, parseInt(process.env.HOUTINI_LM_MAX_FILE_MB |
 // Unset = current behaviour (any absolute path). When set (colon- or
 // comma-separated), reads are confined to these roots AFTER symlink resolution,
 // so a prompt-injected call can't escape to ~/.ssh/id_rsa via a planted symlink.
+// Roots are realpath'd (not just resolved) so they compare correctly against the
+// realpath'd file below — otherwise a root under a symlinked ancestor (e.g. macOS
+// /tmp → /private/tmp) would never match and every confined read would fail. A
+// non-existent root falls back to resolve(), which simply won't match anything.
 const FILE_ROOTS: string[] = (process.env.HOUTINI_LM_FILE_ROOTS || '')
   .split(/[:,]/)
   .map((r) => r.trim())
   .filter(Boolean)
-  .map((r) => resolve(r));
+  .map((r) => { try { return realpathSync(resolve(r)); } catch { return resolve(r); } });
 
 /**
  * Read a file for code_task_files with size and (optional) root confinement.
@@ -956,9 +961,17 @@ async function chatCompletionStreamingInner(
   // contends across processes. Keepalive via sendProgress during the wait so a
   // queued call doesn't sit silent past the client's request timeout. Fail-open:
   // the lock module returns a no-op release on error or after the wait cap.
+  const canKeepalive = options.progressToken !== undefined;
   const releaseInferenceLock = profile.serialiseInference
-    ? await acquireInferenceLock((waitedMs) =>
-        sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`))
+    ? await acquireInferenceLock({
+        onWait: canKeepalive
+          ? (waitedMs) => sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`)
+          : undefined,
+        // Without a progressToken we can't keep the client alive during a long
+        // wait, so fail open well before the typical ~60s client request timeout
+        // rather than sit silent in the queue and get aborted.
+        maxWaitMs: canKeepalive ? undefined : 45_000,
+      })
     : () => { /* parallel-friendly backend (e.g. OpenRouter) */ };
 
   try {
@@ -1201,18 +1214,17 @@ async function chatCompletionStreamingInner(
   //      real answer. Strip everything up to and including the first closer.
   let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag
-  // Orphaned closing tag (Ollama Qwen3 streams reasoning on the content channel
-  // then a bare </think> before the answer). Strip everything up to the first
-  // closer — but ONLY when the prefix looks like reasoning, not a real answer
-  // that happens to quote the literal string "</think>". We bias toward NOT
-  // stripping: a leaked reasoning prefix is visible and recoverable, whereas
-  // deleting answer text is silent, unrecoverable loss. Backticks before the
-  // closer indicate quoted/answer code, so we leave those untouched.
-  {
-    const closerIdx = cleanContent.indexOf('</think>');
-    if (closerIdx !== -1 && !cleanContent.slice(0, closerIdx).includes('`')) {
-      cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
-    }
+  // Orphaned closing tag: reasoning streamed on the content channel then a bare
+  // </think> before the answer (Ollama Qwen3). Strip up to the first closer ONLY
+  // for models KNOWN to emit think blocks (per the cached profile). For any other
+  // model, leave it: a real answer that merely quotes "</think>" would otherwise
+  // be truncated — and a leaked reasoning prefix (visible, recoverable) is a far
+  // safer failure than deleting answer text (silent, unrecoverable). The earlier
+  // backtick heuristic was lose-lose (leaked reasoning containing code, still
+  // deleted answers with an unquoted literal); the profile flag is the right signal.
+  const thinkProfile = await getThinkingSupport(modelId).catch(() => null);
+  if (thinkProfile?.emitsThinkBlocks && cleanContent.includes('</think>')) {
+    cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
   }
   cleanContent = cleanContent.trim();
 
