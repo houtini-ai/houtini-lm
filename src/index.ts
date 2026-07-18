@@ -851,10 +851,29 @@ function validTemperature(v: unknown): number | undefined {
   return Number.isFinite(n) && n >= 0 && n <= 2 ? n : undefined;
 }
 
+/**
+ * Minimum caller-supplied max_tokens the server will honour. Values below this
+ * are discarded so the dynamic context-based budget (25% of the model's context
+ * window) applies instead — MCP clients habitually pass tiny caps like 256 that
+ * strangle reasoning models. Set HOUTINI_LM_MIN_TOKENS=0 to honour any value
+ * (e.g. deliberate micro-chunking on slow hardware), or a different floor.
+ */
+const MIN_MAX_TOKENS = (() => {
+  const v = Number(process.env.HOUTINI_LM_MIN_TOKENS);
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4096;
+})();
+
 /** Clamp a caller-supplied max_tokens to a positive sane range, or undefined. */
 function validMaxTokens(v: unknown): number | undefined {
   const n = typeof v === 'number' ? v : NaN;
-  return Number.isInteger(n) && n > 0 && n <= 1_000_000 ? n : undefined;
+  if (!Number.isInteger(n) || n <= 0 || n > 1_000_000) return undefined;
+  if (n < MIN_MAX_TOKENS) {
+    process.stderr.write(
+      `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor — ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
+    );
+    return undefined;
+  }
+  return n;
 }
 
 /**
@@ -926,14 +945,32 @@ async function chatCompletionStreamingInner(
 
   // Derive max_tokens from the model's actual context window when not explicitly set.
   // Uses 25% of context as a generous output budget (e.g. 262K context → 65K output).
-  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-  if (!options.maxTokens) {
+  let contextLen: number | undefined;
+  {
     const activeModel = await resolveActive();
-    if (activeModel) {
-      const ctx = getContextLength(activeModel);
-      effectiveMaxTokens = Math.floor(ctx * 0.25);
-    }
+    if (activeModel) contextLen = getContextLength(activeModel);
   }
+  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (!options.maxTokens && contextLen) {
+    effectiveMaxTokens = Math.floor(contextLen * 0.25);
+  }
+
+  // Never request more output than the context window can hold alongside the
+  // prompt — vLLM (and strict OpenAI backends) reject prompt+max_tokens >
+  // context with a 400 instead of clamping. Conservative prompt estimate:
+  // 1 token ≈ 3 chars, plus per-message overhead.
+  const promptChars = messages.reduce(
+    (n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length),
+    0,
+  );
+  const capToContext = (requested: number): number => {
+    if (!contextLen) return requested;
+    const cap = contextLen - (Math.ceil(promptChars / 3) + 64 * messages.length + 512);
+    // If the prompt alone (over)fills the context, don't mangle the request —
+    // let the backend report the real overflow.
+    return cap > 0 ? Math.min(requested, cap) : requested;
+  };
+  effectiveMaxTokens = capToContext(effectiveMaxTokens);
 
   const body: Record<string, unknown> = {
     messages,
@@ -995,7 +1032,7 @@ async function chatCompletionStreamingInner(
     // guarantee the model generates less of it.
     body.reasoning = { exclude: true };
     const beforeInflation = effectiveMaxTokens;
-    const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+    const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
     body.max_tokens = inflated;
     body.max_completion_tokens = inflated;
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
@@ -1010,7 +1047,7 @@ async function chatCompletionStreamingInner(
       // Inflation uses effectiveMaxTokens (the context-aware value), not
       // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
       const beforeInflation = effectiveMaxTokens;
-      const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+      const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
       process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
@@ -1908,7 +1945,8 @@ const TOOLS = [
       '(1) Send COMPLETE context — the local LLM cannot read files.\n' +
       '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
       '(3) Specific system persona beats generic — "Senior TypeScript dev" not "helpful assistant".\n' +
-      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n\n' +
+      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n' +
+      '(5) Leave max_tokens UNSET — the server sizes the budget from the model\'s real context window. Tiny caps like 256 waste the model: reasoning burns the budget before any visible output.\n\n' +
       'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens kept in the user\'s quota.',
     inputSchema: {
       type: 'object' as const,
@@ -1927,7 +1965,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384). Pass a number to cap it tighter for quick answers.',
+          description: 'Response token budget. OMIT THIS — when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. Small caps like 256/512/1024 strangle reasoning models (hidden thinking burns the budget before visible output), so values below 4,096 are IGNORED and the dynamic budget applies. Only set this to raise the ceiling for very long outputs.',
         },
         json_schema: {
           type: 'object',
@@ -1979,7 +2017,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         json_schema: {
           type: 'object',
@@ -2027,7 +2065,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
@@ -2072,7 +2110,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Optional output budget override. Defaults to 25% of the loaded model\'s context window.',
+          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%). Values below 4,096 are IGNORED and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
@@ -2426,7 +2464,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // avoids the under-prediction a ratio-of-averages produces on inputs
         // much larger than the historical mean.
         const estimate = await estimatePrefill(combined.length, route.modelId);
-        const isConfidentEstimate = estimate.basis === 'linear-fit' || estimate.basis === 'ratio';
+        // A poor fit (low R² — e.g. bimodal samples straddling a backend
+        // restart with different perf settings) must not refuse the call: a
+        // false refusal is worse than a false-ok that the prefill keepalive
+        // and timeout machinery already handle.
+        const isConfidentEstimate =
+          (estimate.basis === 'linear-fit' && estimate.fit!.r2 >= 0.5) ||
+          estimate.basis === 'ratio';
         if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'

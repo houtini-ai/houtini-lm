@@ -1085,29 +1085,44 @@ export interface PrefillFit {
 }
 
 /**
- * Ordinary-least-squares linear regression: ttft_ms ≈ α + β·prompt_tokens.
- * Returns null when there are too few samples or zero variance in the inputs
- * (e.g. every sample happened to have the same prompt size).
+ * Half-life (in samples) for the recency weighting below. A backend restart
+ * with different settings (vLLM batching flags, quant, GPU split) changes the
+ * prefill regime entirely; without decay, stale samples from the old regime
+ * poison the fit for up to PREFILL_SAMPLES_PER_MODEL calls.
+ */
+const PREFILL_FIT_HALF_LIFE_SAMPLES = 6;
+
+/**
+ * Recency-weighted least-squares linear regression:
+ * ttft_ms ≈ α + β·prompt_tokens, with sample weights decaying by half every
+ * PREFILL_FIT_HALF_LIFE_SAMPLES samples (newest weighted highest — `samples`
+ * arrives oldest-first). Returns null when there are too few samples or zero
+ * variance in the inputs (e.g. every sample had the same prompt size).
  */
 export function fitPrefillLinear(samples: PrefillSample[]): PrefillFit | null {
   const n = samples.length;
   if (n < PREFILL_FIT_MIN_SAMPLES) return null;
 
-  let sumX = 0, sumY = 0;
-  for (const s of samples) {
-    sumX += s.promptTokens;
-    sumY += s.ttftMs;
+  const weight = (i: number) => 0.5 ** ((n - 1 - i) / PREFILL_FIT_HALF_LIFE_SAMPLES);
+
+  let sumW = 0, sumX = 0, sumY = 0;
+  for (let i = 0; i < n; i++) {
+    const w = weight(i);
+    sumW += w;
+    sumX += w * samples[i].promptTokens;
+    sumY += w * samples[i].ttftMs;
   }
-  const meanX = sumX / n;
-  const meanY = sumY / n;
+  const meanX = sumX / sumW;
+  const meanY = sumY / sumW;
 
   let num = 0, denX = 0, denY = 0;
-  for (const s of samples) {
-    const dx = s.promptTokens - meanX;
-    const dy = s.ttftMs - meanY;
-    num += dx * dy;
-    denX += dx * dx;
-    denY += dy * dy;
+  for (let i = 0; i < n; i++) {
+    const w = weight(i);
+    const dx = samples[i].promptTokens - meanX;
+    const dy = samples[i].ttftMs - meanY;
+    num += w * dx * dy;
+    denX += w * dx * dx;
+    denY += w * dy * dy;
   }
 
   // Zero variance in X — every sample was the same prompt size. Can't fit
@@ -1116,7 +1131,7 @@ export function fitPrefillLinear(samples: PrefillSample[]): PrefillFit | null {
 
   const beta = num / denX;
   const alpha = meanY - beta * meanX;
-  // R² via sum-of-squares. Falls back to 0 when denY=0 (all-same TTFTs, rare).
+  // Weighted R². Falls back to 0 when denY=0 (all-same TTFTs, rare).
   const r2 = denY > 0 ? (num * num) / (denX * denY) : 0;
 
   return { alphaMs: alpha, betaMsPerToken: beta, r2, n };
