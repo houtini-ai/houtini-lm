@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.2.0] - 2026-07-18
+
+### Added
+- **`max_tokens` floor** (`HOUTINI_LM_MIN_TOKENS`, default 4096) — caller-supplied budgets below the floor are ignored and the dynamic 25%-of-context budget applies instead. MCP clients habitually pass tiny caps like 256 that strangle reasoning models. Set to `0` to honour any value (deliberate micro-chunking on slow hardware). Tool schema descriptions rewritten to match.
+- **vLLM backend documentation** (docs/VLLM-BACKEND.md).
+
+### Fixed
+- **Output budget capped to context** — requested/inflated `max_tokens` is clamped to `context − estimated prompt`; strict backends (vLLM) previously rejected the ×4-inflated thinking-model budget with a 400 when it exceeded the context window.
+- **Prefill estimator regime changes** — the linear fit is recency-weighted (half-life 6 samples) so a backend restart with different performance settings stops poisoning the estimate; a low-confidence fit (R² < 0.5) can no longer refuse a call.
+
+### Changed
+- Dependencies updated in-range (`@modelcontextprotocol/sdk` 1.29.0).
+
 ## [3.1.0] - 2026-07-17
 
 ### Added
