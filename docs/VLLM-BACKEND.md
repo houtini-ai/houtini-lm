@@ -14,7 +14,7 @@ Qwen3.6 **thinks before answering**: 100–400+ reasoning tokens on trivial prom
 
 - Too-low `max_tokens` → HTTP 200 with **empty/truncated `content`** and the budget burned on thinking. Looks like a model failure; it's a client config bug. (Verified: `max_tokens=200` → empty content.)
 - The raw `/v1/completions` endpoint defaults `max_tokens` to **16** when unset — never rely on defaults.
-- The `HOUTINI_LM_MIN_TOKENS` floor (default 4096) is the right mitigation — keep it. For code-generation/review tasks 8192 is safer.
+- The `HOUTINI_LM_MIN_TOKENS` floor (default 4096) is the right *floor*, but real budgets should be far higher — `max_tokens` is a runaway brake, not a throttle; unused budget costs nothing. Working numbers: 8k for no-think execution calls, **32k for generation and thinking-enabled calls** (a single 1,000-line file is ~13k tokens; Qwen themselves recommend ~32k output headroom for hard reasoning). Only real constraint: prompt + output ≤ 131k context, and vLLM caps automatically.
 - The response carries a separate `reasoning` field (server runs `--reasoning-parser qwen3`): `content` = the answer, `reasoning` = chain-of-thought. Don't concatenate them into results; optionally expose reasoning for debugging.
 
 ## Thinking mode is client-controllable — default it OFF for orchestrated calls
