@@ -17,6 +17,16 @@ Qwen3.6 **thinks before answering**: 100–400+ reasoning tokens on trivial prom
 - The `HOUTINI_LM_MIN_TOKENS` floor (default 4096) is the right mitigation — keep it. For code-generation/review tasks 8192 is safer.
 - The response carries a separate `reasoning` field (server runs `--reasoning-parser qwen3`): `content` = the answer, `reasoning` = chain-of-thought. Don't concatenate them into results; optionally expose reasoning for debugging.
 
+## Thinking mode is client-controllable — default it OFF for orchestrated calls
+
+Qwen3.6's thinking can be disabled per-request via the standard vLLM passthrough:
+
+```json
+{ "chat_template_kwargs": { "enable_thinking": false } }
+```
+
+Measured on the same server, same tool-call request: **thinking=true → 135 tokens, 3.7s; thinking=false → 26 tokens, 0.8s** — identical correct structured tool call. When Claude orchestrates (Claude does the strategic reasoning, the local model executes), no-think is the right default: ~4x faster responses and far smaller token budgets needed. Expose thinking as an opt-in per call for genuinely hard standalone subtasks (tricky refactors, maths). With thinking off, the empty-content trap in Caveat 1 also largely disappears — but keep the min-tokens floor anyway for thinking-enabled calls.
+
 ## Caveat 2 — tool calls
 
 - Server-side parsers translate each model's native dialect to the standard OpenAI `tool_calls` schema (per-model parser matrix in `C:\dev\local-llm\docs\vllm-setup.md`). Client needs **zero** model-specific handling — but when `tool_calls` is present, `content` is typically `null`; handle that.
