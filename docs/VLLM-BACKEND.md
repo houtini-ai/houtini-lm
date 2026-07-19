@@ -54,6 +54,20 @@ The tuning plan enables vLLM prefix caching, which reuses KV for **byte-identica
 
 Done right, TTFT on repeated 16k-token delegation contexts drops from seconds to near-zero — this is the single biggest UX win available for the future version.
 
+## Routing spec (for the optimised version — "something that just knows")
+
+The measured fleet (see `C:\dev\local-llm\docs\MODELS.md`) maps cleanly onto houtini-lm's task types:
+
+| Task profile | Served model | Measured |
+|---|---|---|
+| extraction / JSON / format / translate | `lfm2.5-8b` | 200 tok/s, strip `<think>` |
+| TypeScript / MCP / Workers codegen | `fable-coder-12b` | correct handlers in ~12s |
+| general drafts / summaries / bulk | `qwen3.6-35b-a3b` | 133 tok/s (boot default) |
+| hard debugging / review (thinking ON) | `qwen3.6-27b` | accuracy flagship |
+| image input | `qwen3-vl-32b` | OCR verified |
+
+Design: (1) static map from tool/task-type first; (2) for ambiguous calls, a sub-second LFM2.5 classification request picks the role (~50 tokens — the fleet routes the fleet); (3) single-GPU reality: routing = swap-or-settle — only trigger a swap (`vllm/swap-model.ps1`, ~2 min) when the queued work amortises it, else settle for the loaded generalist; (4) post-second-GPU: two models warm simultaneously, routing becomes free per-request. Surface the chosen model in the response footer so users can audit routing.
+
 ## Concurrency
 
 vLLM continuous-batches natively — the LM Studio-era "one call at a time" rule can relax in the future version. Measured aggregate throughput at 4 concurrent requests is in `bench-results.jsonl`. Modest parallelism (2–4) is fine; single-stream latency degrades gracefully.
