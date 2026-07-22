@@ -27,6 +27,16 @@ Qwen3.6's thinking can be disabled per-request via the standard vLLM passthrough
 
 Measured on the same server, same tool-call request: **thinking=true → 135 tokens, 3.7s; thinking=false → 26 tokens, 0.8s** — identical correct structured tool call. When Claude orchestrates (Claude does the strategic reasoning, the local model executes), no-think is the right default: ~4x faster responses and far smaller token budgets needed. Expose thinking as an opt-in per call for genuinely hard standalone subtasks (tricky refactors, maths). With thinking off, the empty-content trap in Caveat 1 also largely disappears — but keep the min-tokens floor anyway for thinking-enabled calls.
 
+## BUG (found 2026-07-22, dist-patched, needs source fix)
+
+**vLLM ignores top-level `enable_thinking`; it must be nested in `chat_template_kwargs`.** `src` (compiled to `dist/index.js` ~line 881) sets `body.enable_thinking = false` — correct for LM Studio/Ollama, silently ignored by vLLM. Result on a vLLM thinking model (Qwen3-Coder-Next, Qwen3.6): the answer comes back in `reasoning_content` with **empty `content`** (houtini-lm's think-strip-empty fallback then surfaces raw reasoning — ugly, and breaks code_task output). Verified: same request with `chat_template_kwargs:{enable_thinking:false}` returns clean content.
+
+**Fix (apply in `src`, rebuild dist):** in the `supportsThinkingToggle` branch, alongside `body.enable_thinking = false`, also set:
+```js
+body.chat_template_kwargs = Object.assign({}, body.chat_template_kwargs, { enable_thinking: false });
+```
+Keep the top-level flag too (LM Studio/Ollama compat). The dist was hand-patched on Richard's machine as a stopgap; a rebuild will overwrite it, so land this in source.
+
 ## Caveat 2 — tool calls
 
 - Server-side parsers translate each model's native dialect to the standard OpenAI `tool_calls` schema (per-model parser matrix in `C:\dev\local-llm\docs\vllm-setup.md`). Client needs **zero** model-specific handling — but when `tool_calls` is present, `content` is typically `null`; handle that.
