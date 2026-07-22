@@ -2,8 +2,11 @@
 
 ## [3.2.1] - 2026-07-22
 
+### Added
+- **`HOUTINI_LM_THINKING`** (`auto` | `off` | `on`, default `auto`) — forces the no-think path regardless of model detection. Required when vLLM serves a thinking model under an alias (e.g. `coder-next`) that Hugging Face detection can't identify, so the toggle would otherwise never fire. `off` is the right default when an orchestrator (Claude) does the reasoning and the local model only executes.
+
 ### Fixed
-- **vLLM thinking models returned empty content** — `enable_thinking:false` was sent only as a top-level param, which vLLM's OpenAI server silently ignores (it reads the toggle from `chat_template_kwargs`). Qwen3.6 / Qwen3-Coder-Next then put the answer in `reasoning_content` with empty `content`, so delegation surfaced raw reasoning instead of the answer. Now sent in both shapes (nested for vLLM, top-level for LM Studio / Ollama). Regression-guarded by `test-vllm-thinking.mjs`.
+- **vLLM thinking models returned empty content** — two causes. (1) `enable_thinking:false` was sent only as a top-level param, which vLLM silently ignores (it reads the toggle from `chat_template_kwargs`); now sent in both shapes. (2) HF-metadata detection can't see vLLM's arbitrary served-names, so a real thinking model looked non-thinking and the toggle-branch never ran — addressed by `HOUTINI_LM_THINKING=off`. Together the answer now lands in `content`, not `reasoning_content`. Regression-guarded by `test-vllm-thinking.mjs`; verified end-to-end against live Qwen3-Coder-Next.
 
 ## [3.2.0] - 2026-07-18
 

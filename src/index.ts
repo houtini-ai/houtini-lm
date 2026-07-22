@@ -1038,7 +1038,16 @@ async function chatCompletionStreamingInner(
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
   } else if (modelId) {
     const thinking = await getThinkingSupport(modelId);
-    if (thinking?.supportsThinkingToggle) {
+    // HF-metadata detection can't see vLLM's arbitrary served-names (e.g. an
+    // endpoint that serves "coder-next" instead of the real Qwen3-Coder-Next id),
+    // so a genuine thinking model looks non-thinking and the no-think toggle
+    // never fires — the answer then lands in reasoning_content with empty content.
+    // HOUTINI_LM_THINKING=off forces no-think for every call regardless of
+    // detection (correct when an orchestrator does the reasoning and the local
+    // model only executes). 'on' would force the opposite; unset/'auto' keeps
+    // detection. Only ever suppresses thinking — never fabricates it.
+    const thinkingMode = (process.env.HOUTINI_LM_THINKING || 'auto').toLowerCase();
+    if (thinkingMode === 'off' || thinking?.supportsThinkingToggle) {
       body.enable_thinking = false;
       // vLLM's OpenAI server ONLY honours the toggle when it is nested inside
       // chat_template_kwargs; a top-level enable_thinking is silently dropped
