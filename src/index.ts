@@ -1040,6 +1040,12 @@ async function chatCompletionStreamingInner(
     const thinking = await getThinkingSupport(modelId);
     if (thinking?.supportsThinkingToggle) {
       body.enable_thinking = false;
+      // vLLM's OpenAI server ONLY honours the toggle when it is nested inside
+      // chat_template_kwargs; a top-level enable_thinking is silently dropped
+      // (LM Studio / Ollama accept the top-level form). Without this, vLLM
+      // thinking models (Qwen3.6, Qwen3-Coder-Next) return the answer in
+      // reasoning_content with empty content. Send both shapes for portability.
+      body.chat_template_kwargs = { ...(body.chat_template_kwargs as Record<string, unknown> | undefined), enable_thinking: false };
       const reasoningValue = getReasoningEffortValue(modelId);
       if (reasoningValue !== null) {
         body.reasoning_effort = reasoningValue;

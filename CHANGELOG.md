@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.2.1] - 2026-07-22
+
+### Fixed
+- **vLLM thinking models returned empty content** — `enable_thinking:false` was sent only as a top-level param, which vLLM's OpenAI server silently ignores (it reads the toggle from `chat_template_kwargs`). Qwen3.6 / Qwen3-Coder-Next then put the answer in `reasoning_content` with empty `content`, so delegation surfaced raw reasoning instead of the answer. Now sent in both shapes (nested for vLLM, top-level for LM Studio / Ollama). Regression-guarded by `test-vllm-thinking.mjs`.
+
 ## [3.2.0] - 2026-07-18
 
 ### Added
