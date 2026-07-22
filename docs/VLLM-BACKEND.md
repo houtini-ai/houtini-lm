@@ -27,15 +27,21 @@ Qwen3.6's thinking can be disabled per-request via the standard vLLM passthrough
 
 Measured on the same server, same tool-call request: **thinking=true → 135 tokens, 3.7s; thinking=false → 26 tokens, 0.8s** — identical correct structured tool call. When Claude orchestrates (Claude does the strategic reasoning, the local model executes), no-think is the right default: ~4x faster responses and far smaller token budgets needed. Expose thinking as an opt-in per call for genuinely hard standalone subtasks (tricky refactors, maths). With thinking off, the empty-content trap in Caveat 1 also largely disappears — but keep the min-tokens floor anyway for thinking-enabled calls.
 
-## BUG (found 2026-07-22, dist-patched, needs source fix)
+## RESOLVED in v3.2.1 — vLLM thinking models returned empty content
 
-**vLLM ignores top-level `enable_thinking`; it must be nested in `chat_template_kwargs`.** `src` (compiled to `dist/index.js` ~line 881) sets `body.enable_thinking = false` — correct for LM Studio/Ollama, silently ignored by vLLM. Result on a vLLM thinking model (Qwen3-Coder-Next, Qwen3.6): the answer comes back in `reasoning_content` with **empty `content`** (houtini-lm's think-strip-empty fallback then surfaces raw reasoning — ugly, and breaks code_task output). Verified: same request with `chat_template_kwargs:{enable_thinking:false}` returns clean content.
+Two causes, both fixed in source and verified end-to-end against live Qwen3-Coder-Next:
 
-**Fix (apply in `src`, rebuild dist):** in the `supportsThinkingToggle` branch, alongside `body.enable_thinking = false`, also set:
-```js
-body.chat_template_kwargs = Object.assign({}, body.chat_template_kwargs, { enable_thinking: false });
-```
-Keep the top-level flag too (LM Studio/Ollama compat). The dist was hand-patched on Richard's machine as a stopgap; a rebuild will overwrite it, so land this in source.
+1. **Wrong param shape.** houtini-lm sent `enable_thinking:false` only at the top level (correct for LM Studio/Ollama), which vLLM's OpenAI server silently ignores — it reads the toggle from `chat_template_kwargs`. Now sent in **both** shapes. The answer no longer lands in `reasoning_content` with empty `content`.
+2. **Detection gap.** houtini-lm decides whether to send the toggle by identifying the model as a thinking model from Hugging Face metadata — but vLLM serves under arbitrary aliases (e.g. `coder-next`) that resolve to nothing on HF, so a genuine thinking model looked non-thinking and the toggle-branch never ran.
+
+**Fix for the detection gap: `HOUTINI_LM_THINKING`** (`auto` | `off` | `on`, default `auto`).
+- `off` forces the no-think path for every call regardless of detection — the correct setting when Claude orchestrates and the local model only executes, and **required** for any vLLM model served under an alias.
+- `auto` keeps HF-metadata detection (fine for LM Studio / Ollama where the model id is the real one).
+- `on` forces thinking on.
+
+Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `test-vllm-thinking.mjs` (`npm run test:vllm`).
+
+> Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. For genuinely hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
 
 ## Caveat 2 — tool calls
 
