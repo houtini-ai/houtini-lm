@@ -4,9 +4,30 @@ The local model now runs on vLLM in Docker (dual RTX 4090 48GB rig, `C:\dev\loca
 
 ## Connection
 
-- Endpoint: `http://localhost:8000` (OpenAI-compatible, paths `/v1/chat/completions` etc.)
-- Model name: use the **served name** `qwen3.6-27b` — it stays stable when the underlying quant changes (FP8 → AWQ). Auto-detect via `/v1/models` also works: vLLM reports exactly one model (the loaded one).
-- No auth (localhost only).
+As of 2026-07-23 houtini-lm no longer talks to vLLM directly — it points at a **LiteLLM router** (`C:\dev\local-llm\litellm`, Docker, port 4000) that fronts the whole fleet behind one OpenAI-compatible endpoint. This unlocks per-call model selection across local *and* cheap API tiers, which a single vLLM endpoint can't do.
+
+- Endpoint: `http://127.0.0.1:4000` (set `HOUTINI_LM_ENDPOINT_URL`). Use `127.0.0.1`, not `localhost` — WSL2 mirrored networking resolves `localhost` to IPv6 and times out.
+- Auth: the router requires a master key. Set `HOUTINI_LM_API_KEY` to the value of `LITELLM_MASTER_KEY` in `C:\dev\local-llm\litellm\.env`.
+- Model names are now **router-level aliases**, selectable per call via the `model` param (all houtini-lm tools accept it):
+
+| Tier | `model` value | Cost | Notes |
+|---|---|---|---|
+| free / local | `local` | free | whatever preset vLLM currently serves (default `coder-next`); swapping the vLLM preset changes what `local` means |
+| cheapest API | `deepseek-v4-flash`, `deepseek-v4-pro` | ~$ | reasoning models — leave `max_tokens` unset (see Caveat 1) |
+| mid tier | `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k3` | ~$3/$15 | Moonshot, 1M context; `k2.7-code*` are non-thinking, `k3` reasons |
+
+**The routing ladder** (cheapest capable tier first):
+
+1. **`local`** — free, bounded execution: review, boilerplate, tests-from-spec, extraction, conversion. Volume costs nothing.
+2. **`deepseek-v4-flash` / `-pro`** — cheapest API, high-volume general text when local is busy.
+3. **`kimi-k2.7-code` / `k3`** — stronger mid-tier, huge context; substantial modules, long documents, reasoning over a large pasted corpus.
+4. **Claude (don't delegate)** — orchestration, cross-file reasoning, tool use, anything expensive if wrong.
+
+Direct-to-vLLM still works for local-only setups; everything below about vLLM behaviour applies to the `local` alias, since the router passes straight through to it.
+
+### The router must not strip `chat_template_kwargs`
+
+LiteLLM's `drop_params` defaults can silently remove non-standard fields. The config sets `drop_params: false` precisely so the nested `chat_template_kwargs: {enable_thinking: false}` reaches vLLM — without it every `local` call returns blank content (the exact trap in "RESOLVED in v3.2.1" below). Verified 2026-07-23: `local` returns clean content *through the router* with the nested toggle, and empty without it. If local delegation ever goes blank again, re-test this first.
 
 ## Caveat 1 — reasoning model token budgets (the big one)
 
