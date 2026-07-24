@@ -13,15 +13,17 @@ As of 2026-07-23 houtini-lm no longer talks to vLLM directly — it points at a 
 | Tier | `model` value | Cost | Notes |
 |---|---|---|---|
 | free / local | `local` | free | whatever preset vLLM currently serves (default `coder-next`); swapping the vLLM preset changes what `local` means |
-| cheapest API | `deepseek-v4-flash`, `deepseek-v4-pro` | ~$ | reasoning models — leave `max_tokens` unset (see Caveat 1) |
-| mid tier | `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k3` | ~$3/$15 | Moonshot, 1M context; `k2.7-code*` are non-thinking, `k3` reasons |
+| cheap API | `deepseek-v4-flash` | ~$ | reasoning model; the router defaults `max_tokens` to 64k (see Caveat 1) |
+| build / heavy | `deepseek-v4-pro` | ~$ | the full DeepSeek — substantial builds, long reviews, reasoning over a large pasted corpus |
 
 **The routing ladder** (cheapest capable tier first):
 
 1. **`local`** — free, bounded execution: review, boilerplate, tests-from-spec, extraction, conversion. Volume costs nothing.
-2. **`deepseek-v4-flash` / `-pro`** — cheapest API, high-volume general text when local is busy.
-3. **`kimi-k2.7-code` / `k3`** — stronger mid-tier, huge context; substantial modules, long documents, reasoning over a large pasted corpus.
+2. **`deepseek-v4-flash`** — cheap API, high-volume general text when local is busy.
+3. **`deepseek-v4-pro`** — the build/heavy-review tier: substantial modules, long documents, reasoning over a large pasted corpus.
 4. **Claude (don't delegate)** — orchestration, cross-file reasoning, tool use, anything expensive if wrong.
+
+> **Kimi/Moonshot was removed 2026-07-23.** It hung on large non-streamed requests (a ~10k-token review returned `http=000` past 300s), while `deepseek-v4` handled the identical request in ~80s. Revisit only with streaming. DeepSeek V4 is now the API build tier.
 
 Direct-to-vLLM still works for local-only setups; everything below about vLLM behaviour applies to the `local` alias, since the router passes straight through to it.
 
@@ -31,12 +33,12 @@ LiteLLM's `drop_params` defaults can silently remove non-standard fields. The co
 
 ## Caveat 1 — reasoning model token budgets (the big one)
 
-Qwen3.6 **thinks before answering**: 100–400+ reasoning tokens on trivial prompts, thousands on hard ones, consumed from `max_tokens` *before any visible output*.
+**Applies to every reasoning model** — local Qwen, and the router-fronted DeepSeek V4 (and any Kimi/Gemini you add). They **think before answering**: reasoning tokens are spent *before any visible output*, and the cap counts **reasoning + answer together**.
 
-- Too-low `max_tokens` → HTTP 200 with **empty/truncated `content`** and the budget burned on thinking. Looks like a model failure; it's a client config bug. (Verified: `max_tokens=200` → empty content.)
-- The raw `/v1/completions` endpoint defaults `max_tokens` to **16** when unset — never rely on defaults.
-- The `HOUTINI_LM_MIN_TOKENS` floor (default 4096) is the right *floor*, but real budgets should be far higher — `max_tokens` is a runaway brake, not a throttle; unused budget costs nothing. Working numbers: 8k for no-think execution calls, **32k for generation and thinking-enabled calls** (a single 1,000-line file is ~13k tokens; Qwen themselves recommend ~32k output headroom for hard reasoning). Only real constraint: prompt + output ≤ 131k context, and vLLM caps automatically.
-- The response carries a separate `reasoning` field (server runs `--reasoning-parser qwen3`): `content` = the answer, `reasoning` = chain-of-thought. Don't concatenate them into results; optionally expose reasoning for debugging.
+- **A low cap returns empty `content`.** The budget is burned on reasoning and the answer never starts. HTTP 200, `finish_reason: length`, `content: ""`. Looks like a model failure; it's a budget bug. Verified twice: Qwen `max_tokens=200` → empty; **DeepSeek V4 `max_tokens=8000` → 8000 reasoning tokens, `content:""`** — the whole review sat in `reasoning_content` with nothing left to emit it.
+- **The cap is a ceiling, not consumption.** Set it generous — the model stops at `finish_reason: stop` when done and only bills what it generated. Verified: `deepseek-v4-pro` with a 64k ceiling answered a one-word prompt in 35 tokens. Unused budget costs nothing.
+- **Set it high once, stop thinking about it per-call.** The LiteLLM router defaults `max_tokens` to **64k** on the DeepSeek entries, so callers never pass it. On `local`, vLLM sizes to the context window and houtini-lm's `HOUTINI_LM_MIN_TOKENS` floor (4096) is inflated — but for thinking-heavy work prefer an explicit **16k–32k+**. Never rely on a provider's *unset* default: the raw `/v1/completions` endpoint defaults to **16**, and an unset cap on a direct API call can instead run unbounded until the caller times out.
+- The response carries reasoning separately (`reasoning_content` / the `--reasoning-parser` field): `content` = the answer, reasoning = chain-of-thought. Don't concatenate them; expose reasoning only for debugging. If `content` is empty but `reasoning_content` is full, that's the low-cap trap above — raise the budget.
 
 ## Thinking mode is client-controllable — default it OFF for orchestrated calls
 
