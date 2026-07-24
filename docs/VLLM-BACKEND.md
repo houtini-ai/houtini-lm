@@ -33,7 +33,7 @@ LiteLLM's `drop_params` defaults can silently remove non-standard fields. The co
 
 ## Caveat 1 — reasoning model token budgets (the big one)
 
-**Applies to every reasoning model** — local Qwen, and the router-fronted DeepSeek V4 (and any Kimi/Gemini you add). They **think before answering**: reasoning tokens are spent *before any visible output*, and the cap counts **reasoning + answer together**.
+**Applies to every reasoning model** — local Qwen, and the router-fronted DeepSeek V4 (and any hosted reasoner you add, e.g. Gemini). They **think before answering**: reasoning tokens are spent *before any visible output*, and the cap counts **reasoning + answer together**.
 
 - **A low cap returns empty `content`.** The budget is burned on reasoning and the answer never starts. HTTP 200, `finish_reason: length`, `content: ""`. Looks like a model failure; it's a budget bug. Verified twice: Qwen `max_tokens=200` → empty; **DeepSeek V4 `max_tokens=8000` → 8000 reasoning tokens, `content:""`** — the whole review sat in `reasoning_content` with nothing left to emit it.
 - **The cap is a ceiling, not consumption.** Set it generous — the model stops at `finish_reason: stop` when done and only bills what it generated. Verified: `deepseek-v4-pro` with a 64k ceiling answered a one-word prompt in 35 tokens. Unused budget costs nothing.
