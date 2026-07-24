@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.2.2] - 2026-07-24
+
+Docs-only release (no code change). Ships the README addition documenting
+`HOUTINI_LM_THINKING`; the substantive backend notes below live in
+`docs/VLLM-BACKEND.md` on GitHub (docs/ is not part of the npm tarball).
+
+### Documented
+- **README**: the `HOUTINI_LM_THINKING` env var now appears in the configuration table on npm.
+- **LiteLLM router topology** — houtini-lm can sit behind a LiteLLM router that fronts local vLLM + DeepSeek V4 behind one endpoint, selecting tier per call via the `model` param. The router must keep `drop_params: false` so the nested `chat_template_kwargs` no-think toggle reaches vLLM.
+- **Reasoning-model token budgets** generalised from Qwen to every reasoning model (Qwen, DeepSeek V4): the `max_tokens` cap counts reasoning + answer together, so a low cap returns empty content; a generous ceiling is not consumption. (Kimi/Moonshot evaluated and dropped for hanging on large non-streamed requests.)
+
 ## [3.2.1] - 2026-07-22
 
 ### Added
