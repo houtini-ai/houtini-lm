@@ -41,6 +41,9 @@ Claude's the architect. Your local model's the drafter. Claude QAs everything.
 ## Quick start
 
 > New to local models? See **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)** — installing LM Studio or a Docker endpoint, getting an OpenAI-compatible URL for houtini, what the smaller models are good at, and which models fit on 16/32/64/96/128 GB of VRAM.
+>
+> Setting up a specific backend? Step-by-step guides, each with the traps that cause silent failures:
+> **[LM Studio](./docs/SETUP-LMSTUDIO.md)** (easiest, desktop) · **[vLLM](./docs/SETUP-VLLM.md)** (throughput, tool-calling, long context).
 
 ### Claude Code
 
@@ -465,10 +468,10 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 
 | What | URL | Notes |
 |------|-----|-------|
-| [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config. Rich metadata via v0 API. |
+| [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config. Rich metadata via v0 API. **[Setup guide →](./docs/SETUP-LMSTUDIO.md)** |
 | [Ollama](https://ollama.com) | `http://localhost:11434` | Set `HOUTINI_LM_ENDPOINT_URL`. Thinking models (qwen3, deepseek-r1) handled transparently — reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
 | [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models from one endpoint. Auto-detected — sends attribution headers, uses `reasoning.exclude` for thinking models, retries 429/5xx with jittered backoff, parallel requests allowed. |
-| [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API |
+| [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API. **[Setup guide →](./docs/SETUP-VLLM.md)** |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
 | [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | 28c/M input tokens |
 | [Groq](https://groq.com) | `https://api.groq.com/openai` | ~750 tok/s |

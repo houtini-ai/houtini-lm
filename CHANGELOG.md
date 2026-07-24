@@ -7,6 +7,7 @@ Docs-only release (no code change). Ships the README addition documenting
 `docs/VLLM-BACKEND.md` on GitHub (docs/ is not part of the npm tarball).
 
 ### Documented
+- **Backend setup guides**: new step-by-step [SETUP-VLLM.md](docs/SETUP-VLLM.md) and [SETUP-LMSTUDIO.md](docs/SETUP-LMSTUDIO.md), each carrying the traps that cause silent failures (no-think toggle, tool-call parser, cold-start timeouts, the Ada block-FP8 kernel trap). Linked from the README quick start and endpoints table.
 - **README**: the `HOUTINI_LM_THINKING` env var now appears in the configuration table on npm.
 - **LiteLLM router topology** — houtini-lm can sit behind a LiteLLM router that fronts local vLLM + DeepSeek V4 behind one endpoint, selecting tier per call via the `model` param. The router must keep `drop_params: false` so the nested `chat_template_kwargs` no-think toggle reaches vLLM.
 - **Reasoning-model token budgets** generalised from Qwen to every reasoning model (Qwen, DeepSeek V4): the `max_tokens` cap counts reasoning + answer together, so a low cap returns empty content; a generous ceiling is not consumption. (Kimi/Moonshot evaluated and dropped for hanging on large non-streamed requests.)
