@@ -26,7 +26,7 @@ Model sizing, and which ones are worth delegating to, is in [GETTING-STARTED.md]
 
 ## 2. Point houtini-lm at it
 
-Ollama serves on **port 11434**. Pass the host and port only — houtini-lm appends the API paths itself.
+Ollama serves on **port 11434**. Pass the host and port only - houtini-lm appends the API paths itself.
 
 **Claude Code:**
 
@@ -70,11 +70,11 @@ If `discover` reports offline, check Ollama is actually listening: `curl http://
 
 Three things are handled for you. They're worth knowing because they explain behaviour that looks odd otherwise.
 
-**Detection uses `/api/tags`, not `/v1/models`.** Ollama's native list endpoint returns richer data than the OpenAI-compatible one — family, quantisation level, parameter size — so houtini-lm probes it first and maps the result. That's how `list_models` can tell you a model is `qwen2` family at `Q4_K_M` when the OpenAI endpoint would only give you a name.
+**Detection uses `/api/tags`, not `/v1/models`.** Ollama's native list endpoint returns richer data than the OpenAI-compatible one - family, quantisation level, parameter size - so houtini-lm probes it first and maps the result. That's how `list_models` can tell you a model is `qwen2` family at `Q4_K_M` when the OpenAI endpoint would only give you a name.
 
 **Every listed model reports as loaded.** Ollama loads on demand rather than keeping one model resident, so there's no meaningful loaded-vs-available split to show. houtini-lm marks everything listed as available. The practical consequence: the *first* call to a model you haven't used recently includes load time, which on a 32B can be tens of seconds. That isn't a hang.
 
-**Reasoning arrives on a different channel.** Ollama's OpenAI-compatible endpoint streams thinking-model reasoning on `delta.reasoning`, where vLLM uses `reasoning_content` and some models emit `<think>` inline. houtini-lm reads all three and strips them, so you get the answer rather than the working out. Qwen3 on Ollama is the awkward case — it streams reasoning directly and can produce an orphan `</think>` closer with no opener, which is handled explicitly.
+**Reasoning arrives on a different channel.** Ollama's OpenAI-compatible endpoint streams thinking-model reasoning on `delta.reasoning`, where vLLM uses `reasoning_content` and some models emit `<think>` inline. houtini-lm reads all three and strips them, so you get the answer rather than the working out. Qwen3 on Ollama is the awkward case - it streams reasoning directly and can produce an orphan `</think>` closer with no opener, which is handled explicitly.
 
 ## Gotchas
 
@@ -84,6 +84,6 @@ Three things are handled for you. They're worth knowing because they explain beh
 
 **Reasoning effort is `none`, not `low`.** Ollama documents `none` as a valid value; the generic OpenAI spec starts at `low`. houtini-lm sends the right one per backend, so this only matters if you're driving the endpoint yourself.
 
-**Remote hosts need `OLLAMA_HOST`.** Ollama binds to localhost by default. To reach it from another machine, start it with `OLLAMA_HOST=0.0.0.0` and point `HOUTINI_LM_ENDPOINT_URL` at the box's LAN address — `http://192.168.1.50:11434`. Don't expose it to the internet; there's no auth.
+**Remote hosts need `OLLAMA_HOST`.** Ollama binds to localhost by default. To reach it from another machine, start it with `OLLAMA_HOST=0.0.0.0` and point `HOUTINI_LM_ENDPOINT_URL` at the box's LAN address - `http://192.168.1.50:11434`. Don't expose it to the internet; there's no auth.
 
-**Empty responses usually mean thinking ate the budget.** If a reply comes back empty or as just a footer, see [troubleshooting.md](../manual/troubleshooting.md) — the first entry covers it. `HOUTINI_LM_THINKING=off` forces the no-think toggle when model detection can't identify a thinking model behind an alias.
+**Empty responses usually mean thinking ate the budget.** If a reply comes back empty or as just a footer, see [troubleshooting.md](../manual/troubleshooting.md) - the first entry covers it. `HOUTINI_LM_THINKING=off` forces the no-think toggle when model detection can't identify a thinking model behind an alias.
