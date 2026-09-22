@@ -1959,6 +1959,51 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   return lines.join('\n');
 }
 
+/**
+ * Machine-readable sidecar for the inference tools, returned as `structuredContent`
+ * alongside the human-readable text. Lets an orchestrator branch on quality, token
+ * usage and quota savings without regex-parsing the footer. Metadata only - the
+ * answer stays in the text content block, so the payload isn't duplicated. No
+ * `outputSchema` is declared: on the low-level Server that would invoke client-side
+ * validation and risk an outputSchema-aware client rendering only the structured
+ * object and dropping the answer. Call AFTER formatFooter so quotaSaved reflects
+ * the call just recorded.
+ */
+function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>): Record<string, unknown> {
+  const quality = assessQuality(resp, resp.rawContent);
+  const flags: string[] = [];
+  if (quality.prefillStall) flags.push('prefill-stall');
+  else if (quality.truncated) flags.push('truncated');
+  if (quality.reasoningFallback) flags.push('reasoning-only');
+  else if (quality.thinkStripFallback) flags.push('think-strip-empty');
+  else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
+  if (quality.estimatedTokens) flags.push('tokens-estimated');
+  if (quality.finishReason === 'length') flags.push('hit-max-tokens');
+  if (quality.finishReason === 'content_filter') flags.push('content-filtered');
+  if (resp.streamError) flags.push('upstream-error');
+  return {
+    model: resp.model || null,
+    tokens: {
+      prompt: resp.usage?.prompt_tokens ?? null,
+      completion: resp.usage?.completion_tokens ?? null,
+      reasoning: resp.usage?.completion_tokens_details?.reasoning_tokens ?? null,
+      cached: resp.usage?.prompt_tokens_details?.cached_tokens ?? null,
+    },
+    performance: { ttftMs: resp.ttftMs ?? null, tokPerSec: computeTokPerSec(resp) },
+    quality: flags,
+    truncated: resp.truncated,
+    finishReason: resp.finishReason || null,
+    streamError: resp.streamError ?? null,
+    quotaSaved: {
+      sessionTokens: session.promptTokens + session.completionTokens,
+      sessionCalls: session.calls,
+      lifetimeTokens: lifetime.totalTokens,
+      lifetimeCalls: lifetime.totalCalls,
+    },
+    ...(extra ?? {}),
+  };
+}
+
 // ── MCP Tool definitions ─────────────────────────────────────────────
 
 // Optional sampling controls shared by the inference tools. Out-of-range values
@@ -2341,7 +2386,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
 
         const footer = formatFooter(resp);
-        return { content: [{ type: 'text', text: resp.content + footer }] };
+        return {
+          content: [{ type: 'text', text: resp.content + footer }],
+          structuredContent: buildStructured(resp),
+        };
       }
 
       case 'custom_prompt': {
@@ -2391,6 +2439,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const footer = formatFooter(resp);
         return {
           content: [{ type: 'text', text: resp.content + footer }],
+          structuredContent: buildStructured(resp),
         };
       }
 
@@ -2437,7 +2486,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const codeFooter = formatFooter(codeResp, lang);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+        return {
+          content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }],
+          structuredContent: buildStructured(codeResp, { language: lang }),
+        };
       }
 
       case 'code_task_files': {
@@ -2575,7 +2627,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : `${successCount}/${paths.length} file(s) read`;
         const codeFooter = formatFooter(codeResp, `${lang} · ${readSummary}`);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+        return {
+          content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }],
+          structuredContent: buildStructured(codeResp, {
+            language: lang,
+            filesRead: successCount,
+            filesTotal: paths.length,
+          }),
+        };
       }
 
       case 'discover': {
@@ -2792,16 +2851,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // or exceeding its result-size limit. Dimensions are preserved.
           const compact = (embedding as number[]).map((x) => Number(x.toPrecision(7)));
 
+          const embedResult = {
+            model: data.model,
+            dimensions: embedding.length,
+            embedding: compact,
+            usage: usageInfo,
+          };
           return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                model: data.model,
-                dimensions: embedding.length,
-                embedding: compact,
-                usage: usageInfo,
-              }),
-            }],
+            content: [{ type: 'text', text: JSON.stringify(embedResult) }],
+            structuredContent: embedResult,
           };
         });
       }

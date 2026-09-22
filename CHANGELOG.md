@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Structured tool output.** The five inference tools (`chat`, `custom_prompt`, `code_task`, `code_task_files`, `embed`) now return `structuredContent` alongside the human-readable text - a machine-readable sidecar carrying model id, token usage (prompt / completion / reasoning / cached), measured TTFT and tok/s, quality flags, truncation/finish reason, and the running quota-saved counters (`embed` returns the embedding object). An orchestrator can branch on these without regex-parsing the footer. The answer stays in the text `content` block, so the payload isn't duplicated; no `outputSchema` is declared yet (that invokes client-side validation and is a tested follow-up), so every client keeps rendering the answer exactly as before. Verified end-to-end against a mock OpenAI endpoint.
+
 ## [3.2.3] - 2026-08-03
 
 ### Fixed
