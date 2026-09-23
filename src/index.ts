@@ -2802,7 +2802,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : `not reported by the backend (assuming ${ctx.toLocaleString()} - set HOUTINI_LM_CONTEXT_WINDOW to correct it)`;
 
         let text =
-          `Status: ONLINE\n` +
+          `Status: ONLINE (houtini-lm ${SERVER_VERSION})\n` +
           `Endpoint: ${redactUrl(LM_BASE_URL)} (${backendLabel()})\n` +
           `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
           `Active model: ${primary.id}${primary.upstream_model ? ` → ${primary.upstream_model}` : ''}${pinnedEntry ? ' (pinned via HOUTINI_LM_MODEL)' : ''}\n` +

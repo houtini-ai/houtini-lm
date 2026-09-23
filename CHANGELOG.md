@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.3.1] - 2026-09-23
+
+### Fixed
+- **`HOUTINI_LM_THINKING=on` now forces thinking.** It was documented but ignored: any model detected as supporting the thinking toggle was sent `enable_thinking: false` whatever the setting, because detection was ORed straight into the `off` check. `on` now sends `enable_thinking: true` in both the top-level and `chat_template_kwargs` shapes, and still inflates the output budget, since forced thinking is exactly when reasoning eats it. `off` and `auto` behave as before. The three-state resolver comes from PR #34 by @pinboxltd, moved into `src/pure.ts` with a unit test.
+- **Literal models refused open-ended writing.** Every system prompt carried "base your answer only on the information provided in this conversation", and literal models (gpt-6-astra, deepseek-v4-flash) took it at its word, declining tasks that needed their own knowledge and listing what was "missing". The grounding line now applies to supplied code, files and data, and leaves everything else to the model. Reported from the Docker deployment; verified live on gpt-6-astra.
+
+### Added
+- **`discover` shows the houtini-lm version** on its first line, so you can confirm an upgrade actually took (useful with `npx` caching and Docker images).
+- **A user manual split by task:** [install](manual/install.md), [Docker](manual/docker.md) (plain `docker run -i`, and HTTP behind Docker's MCP Gateway, including the measured finding that the gateway build we run doesn't forward progress notifications), [how houtini-lm handles different models](manual/models.md) (with thinking as the user's choice: when `auto`, `off` and `on` are each worth it) and [configuration](manual/configuration.md). The README now gives the overview and links to them.
+
 ## [3.3.0] - 2026-09-23
 
 Router-aware, and properly tested. Verified live against a LiteLLM router fronting a local vLLM model plus hosted DeepSeek and OpenAI tiers.
