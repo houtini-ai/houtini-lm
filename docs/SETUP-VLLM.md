@@ -99,7 +99,11 @@ isn't. Two parts to the fix, both handled by **`HOUTINI_LM_THINKING=off`**:
 - houtini-lm decides *whether* to send it by identifying the model from Hugging Face
   metadata - but your `--served-model-name` alias (e.g. `coder`) resolves to nothing on
   HF, so a real thinking model looks non-thinking and the toggle never fires. `off`
-  forces it regardless. **This is required for any aliased vLLM model.**
+  forces it regardless. **This is required for any vLLM model served directly under
+  an alias.** (If you put a LiteLLM router in front, houtini-lm reads the router's
+  `/model/info`, resolves the alias to the real model and detects thinking on its own -
+  `off` is still the right call when Claude does the reasoning, but no longer the only
+  thing standing between you and empty replies.)
 
 Leave it `off` whenever an orchestrator (Claude) does the reasoning and the local model
 only executes - it's also ~4× faster.

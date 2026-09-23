@@ -231,6 +231,17 @@ Scoring works well when there are a handful of loaded models. On providers with 
 
 Leave both unset and the router picks.
 
+### Behind a LiteLLM router
+
+Point houtini-lm at a [LiteLLM](https://docs.litellm.ai) router and it reads the router's `/model/info` as well as `/v1/models`. That's where the useful facts live: which real model sits behind each alias (`local` → `qwen3.6-27b`), what kind of model it is, and - for hosted models - the true context window and output cap. So houtini-lm:
+
+- profiles each alias as the model it actually is, which also means a thinking model behind an alias gets the no-think toggle automatically;
+- sizes every call's budget from *that* model's limits, never above its declared output cap;
+- leaves TTS, image, video, realtime and moderation models out of `discover`, `list_models` and routing entirely - a real router lists dozens of them;
+- retries 429s with backoff, because a router usually fronts rate-limited cloud tiers.
+
+Two things worth doing on a router. Pin a model (`HOUTINI_LM_MODEL`), because every alias scores the same and ties go to whichever is listed first - `discover` warns you when that's happening. And if your router puts a local GPU model first, that's where unpinned work lands unless you say otherwise.
+
 ## Tools
 
 ### `chat`
@@ -470,14 +481,15 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 | `HOUTINI_LM_ENDPOINT_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API. Legacy alias: `LM_STUDIO_URL`. |
 | `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. Legacy aliases: `LM_STUDIO_PASSWORD`, `LM_PASSWORD`, `OPENROUTER_API_KEY`. |
 | `HOUTINI_LM_MODEL` | *(auto-detect)* | Model identifier - leave blank to use whatever's loaded. Legacy alias: `LM_STUDIO_MODEL`. |
-| `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. Set to `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation. Otherwise auto-detected from the endpoint URL. |
-| `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it. Legacy alias: `LM_CONTEXT_WINDOW`. |
+| `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation; `litellm` for router handling (429 backoff). Otherwise auto-detected - OpenRouter from the URL, LiteLLM from its `/model/info` endpoint. |
+| `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it (`discover` says when it's guessing). Legacy alias: `LM_CONTEXT_WINDOW`. |
+| `HOUTINI_LM_RETRY_RATELIMIT` | *(off)* | Set to `1` to retry 429/5xx with jittered backoff on any backend. On by default for OpenRouter and LiteLLM routers; use this for other proxies that front a rate-limited API. |
 | `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:`/`,`-separated allowlist of directory roots `code_task_files` may read from (symlink-resolved). Unset = any absolute path. |
 | `HOUTINI_LM_MAX_FILE_MB` | `10` | Per-file size cap for `code_task_files`. |
 | `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable just the cross-process inference lock (keeps the in-process semaphore). |
 | `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to disable inference serialisation entirely (both the in-process semaphore and the cross-process lock). Use for backends that batch natively (vLLM, TGI, SGLang) where one-at-a-time only throttles throughput. |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Values below the floor are ignored and the dynamic budget (25% of the model's context window) applies - MCP clients habitually pass tiny caps like 256 that strangle reasoning models. Set to `0` to honour any value (e.g. deliberate micro-chunking on slow hardware). |
-| `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model, `off` forces the no-think path for every call, `on` forces thinking. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes - and **required for vLLM served under an alias** (e.g. `coder-next`), where HF-metadata detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Only ever suppresses thinking; never fabricates it. |
+| `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model, `off` forces the no-think path for every call, `on` forces thinking. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes - and **required for vLLM served directly under an alias** (e.g. `--served-model-name coder-next`), where detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Behind a LiteLLM router the alias is resolved to the real model automatically, so `auto` works there. Only ever suppresses thinking; never fabricates it. |
 
 **Per-request sampling** - `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
 
@@ -493,6 +505,7 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 | [Ollama](https://ollama.com) | `http://localhost:11434` | Set `HOUTINI_LM_ENDPOINT_URL`. Thinking models (qwen3, deepseek-r1) handled transparently - reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
 | [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models from one endpoint. Auto-detected - sends attribution headers, uses `reasoning.exclude` for thinking models, retries 429/5xx with jittered backoff, parallel requests allowed. |
 | [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API. **[Setup guide →](./docs/SETUP-VLLM.md)** |
+| [LiteLLM](https://docs.litellm.ai) router | `http://localhost:4000` | Auto-detected via `/model/info`: aliases resolved to real models, true context and output limits, non-chat models filtered out, 429 backoff. See [Behind a LiteLLM router](#behind-a-litellm-router). |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
 | [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | 28c/M input tokens |
 | [Groq](https://groq.com) | `https://api.groq.com/openai` | ~750 tok/s |

@@ -57,9 +57,13 @@ The "is anyone home?" tool - and the model catalogue. Returns whether the endpoi
 
 Call it at the start of a delegation-heavy session. The measured-speed line is the honest answer to "should I delegate this 3,000-token job or just do it myself?"
 
+On a big catalogue (a LiteLLM router, OpenRouter) it shows the first dozen models and tells you how many more there are, rather than dumping hundreds of entries into your context. Two lines are worth reading closely there: `Context window` says "not reported" when houtini-lm is guessing, and `Routing` warns when nothing is pinned - on a tie, unpinned work goes to whatever's listed first.
+
 ## list_models
 
 Everything the backend has, loaded and merely downloaded, with per-model metadata: type (llm / vlm / embeddings), architecture, quantisation, context length, capability profile. The profiles come from a local SQLite cache that enriches itself from the HuggingFace API at startup (7-day TTL), so even a model the server's never seen gets a useful description by the second session.
+
+Past 30 models it switches to one line each (id, the real model behind a router alias, context, output cap). Behind a LiteLLM router, models that can't chat - TTS, image, video, realtime, moderation - are left out altogether.
 
 ## stats
 
@@ -80,6 +84,8 @@ Model: qwen3.6-27b | 353→2829 tokens | TTFT: 126ms, 18.8 tok/s, 150.3s | types
 - `TTFT` - time to first token. Prefill cost, roughly proportional to input size on your hardware.
 - `tok/s` - decode speed, measured over generation only (prefill excluded, so it's honest).
 - Quality flags appear here too: `TRUNCATED` (hit the token budget - the budget logic makes this rare), `UPSTREAM ERROR`, `content_filter` (a refusal, not a length problem - don't retry it bigger), `think-strip-empty` (the whole response was reasoning; see troubleshooting).
+
+The same facts come back as data, too. Each inference tool returns `structuredContent` next to the text - model, token counts (including reasoning and cached), TTFT and tok/s, quality flags, finish reason and the quota counters - so an orchestrator can branch on `truncated` or a `content-filtered` flag without parsing the footer. The answer itself stays in the text.
 
 ## The max_tokens floor
 

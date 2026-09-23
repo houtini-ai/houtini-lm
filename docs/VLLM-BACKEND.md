@@ -31,6 +31,17 @@ Direct-to-vLLM still works for local-only setups; everything below about vLLM be
 
 LiteLLM's `drop_params` defaults can silently remove non-standard fields. The config sets `drop_params: false` precisely so the nested `chat_template_kwargs: {enable_thinking: false}` reaches vLLM - without it every `local` call returns blank content (the exact trap in "RESOLVED in v3.2.1" below). Verified 2026-07-23: `local` returns clean content *through the router* with the nested toggle, and empty without it. If local delegation ever goes blank again, re-test this first.
 
+### What houtini-lm reads from the router (v3.3)
+
+Since v3.3 houtini-lm calls the router's `/model/info` alongside `/v1/models`. Verified against this fleet 2026-09-23:
+
+- **Aliases resolve to real models.** `local` → `qwen3.6-27b`, `gemma-a` → `gemma4-31b`, `astra` → `gpt-6-astra`. Profiling and thinking detection run on the real name, so `local` is recognised as a Qwen3 thinking model at startup and gets the no-think toggle without `HOUTINI_LM_THINKING=off`. (Keep `off` anyway when Claude is orchestrating - it's faster.)
+- **Hosted models bring their real limits.** `astra` reports 922k input / 128k output, so its budget is sized from those - and never above the 128k cap, which a plain 25%-of-context budget would have exceeded. Self-hosted aliases have no LiteLLM pricing entry, so their limits still fall back to `HOUTINI_LM_CONTEXT_WINDOW` (`discover` says so).
+- **Non-chat models are filtered out.** Of 239 entries, 128 are image, video, audio, realtime or moderation models; they no longer appear in `discover`, `list_models` or routing.
+- **429s back off.** The router profile turns retry-with-backoff on, closing the gap where a batch against `deepseek-v4-pro` silently lost most of its work to rate limiting.
+
+**Pin the model you mean.** Every alias scores the same in routing, so an unpinned call lands on the first listed alias - here `local`, the GPU. `discover` flags this. Set `HOUTINI_LM_MODEL` (e.g. `astra` to keep work off the GPU) or pass `model` per call.
+
 ## Caveat 1 - reasoning model token budgets (the big one)
 
 **Applies to every reasoning model** - local Qwen, and the router-fronted DeepSeek V4 (and any hosted reasoner you add, e.g. Gemini). They **think before answering**: reasoning tokens are spent *before any visible output*, and the cap counts **reasoning + answer together**.
