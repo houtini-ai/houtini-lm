@@ -68,7 +68,7 @@ Check the model's real context window in `discover`, not the family's advertised
 
 ## A 400 saying a parameter isn't supported
 
-**The upstream model rejects something houtini-lm sends.** GPT-6, for example, refuses `temperature` and `max_tokens`. Behind a LiteLLM router, give that model a named route that drops them ([Models that reject parameters](models.md#models-that-reject-parameters)); straight to a provider, open an issue with the error text.
+**The upstream model rejects something houtini-lm sends.** From 3.3.2, OpenAI's GPT-5/6 and o-series models are sent only what they accept, so upgrade first if that's the model. For anything else, behind a LiteLLM router give that model a named route that drops the parameter ([Models that reject parameters](models.md#models-that-reject-parameters)); straight to a provider, open an issue with the error text and I'll add the family.
 
 ## Stats look wrong after switching backends
 

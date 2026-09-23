@@ -11,7 +11,7 @@
  * - Atomic exclusive create (`wx`) of the lock file is the acquire primitive.
  * - Each acquisition writes a UNIQUE token. Every destructive op (release, steal,
  *   exit cleanup) first re-reads the file and only unlinks when the on-disk token
- *   still matches, so a process can NEVER delete a lock it doesn't own — which is
+ *   still matches, so a process can NEVER delete a lock it doesn't own - which is
  *   what previously let a steal race cascade into extra concurrent holders.
  * - Staleness is AGE-FIRST (past the threshold → steal regardless), then same-host
  *   dead-PID (`kill(pid,0)` → ESRCH → steal). Age-first means a reused PID can't
@@ -51,7 +51,7 @@ const STALE_MS = 7 * 60_000;
 //
 // This is DELIBERATELY below STALE_MS, and that is not a bug. shouldSteal() ages out a
 // lock on `Date.now() - info.at`, i.e. the age of the LOCK, not how long the current
-// caller has waited — so a caller arriving at an already-stale lock steals it on its
+// caller has waited - so a caller arriving at an already-stale lock steals it on its
 // first iteration and never consults this cap. Raising it above STALE_MS would only make
 // callers block longer before failing open, which is the wrong direction for a module
 // whose contract is that serialisation is never a correctness dependency.
@@ -76,12 +76,12 @@ process.on('exit', () => {
  * Reading the lock has three distinct failure modes and they need different handling.
  * Collapsing them all to `null` is what allowed a garbled file to wedge the acquire loop:
  *
- * - `missing`    — no file. Just retry the acquire.
- * - `garbled`    — file exists but is empty or not JSON. There is NO token to match, so
+ * - `missing`    - no file. Just retry the acquire.
+ * - `garbled`    - file exists but is empty or not JSON. There is NO token to match, so
  *                  token-checked removal is a no-op and the file must be removed outright
  *                  or nothing will ever clear it. Reachable whenever a holder dies between
  *                  creating the file and writing to it.
- * - `unreadable` — the file exists but we could not read it (EACCES, EBUSY, EIO). This is
+ * - `unreadable` - the file exists but we could not read it (EACCES, EBUSY, EIO). This is
  *                  NOT evidence the lock is dead, so it must never authorise a steal.
  */
 type LockRead =
@@ -143,7 +143,7 @@ function stealIfUnchanged(expectedToken: string | undefined): void {
  * acquire loop retries forever against a file it will not delete.
  *
  * The unconditional unlink is safe precisely because it is gated on `garbled` rather than
- * on any read failure — a lock we merely cannot read is left alone.
+ * on any read failure - a lock we merely cannot read is left alone.
  */
 function removeGarbledLock(): void {
   try { unlinkSync(LOCK_PATH); } catch { /* another waiter beat us to it */ }
@@ -153,7 +153,7 @@ function removeGarbledLock(): void {
  * Acquire the cross-process inference lock. Returns a release function (safe to
  * call more than once; only unlinks if we still own the file). `onWait` is
  * invoked periodically while blocked so the caller can emit keepalive progress.
- * `maxWaitMs` caps the wait before failing open — pass a value under the client
+ * `maxWaitMs` caps the wait before failing open - pass a value under the client
  * request timeout when the caller cannot emit keepalives.
  */
 export async function acquireInferenceLock(
@@ -172,7 +172,7 @@ export async function acquireInferenceLock(
       const fd = openSync(LOCK_PATH, 'wx'); // atomic: EEXIST if already held
       // Once the file exists we own the cleanup obligation. A throw from writeSync would
       // otherwise leak the descriptor AND strand a zero-byte lock that no release and no
-      // exit handler can remove (myToken is not yet set) — which is exactly the garbled
+      // exit handler can remove (myToken is not yet set) - which is exactly the garbled
       // file that used to wedge every other process's acquire loop.
       try {
         writeSync(fd, JSON.stringify({ pid: process.pid, host: HOST, at: Date.now(), token }));
@@ -187,7 +187,7 @@ export async function acquireInferenceLock(
       return () => {
         if (released) return;
         released = true;
-        // Only unlink if the file still carries OUR token — never delete a lock
+        // Only unlink if the file still carries OUR token - never delete a lock
         // that was stolen from us and re-created by someone else.
         if (readLock()?.token === token) {
           try { unlinkSync(LOCK_PATH); } catch { /* ignore */ }
@@ -196,7 +196,7 @@ export async function acquireInferenceLock(
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
-        return () => { /* fail open — run unlocked rather than block */ };
+        return () => { /* fail open - run unlocked rather than block */ };
       }
       const read = readLockDetailed();
       // An unreadable file is not evidence of a dead holder, so it must not authorise a

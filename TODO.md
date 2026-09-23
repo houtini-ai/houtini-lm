@@ -6,7 +6,8 @@ small to warrant an issue. Effort tags: **S** small, **M** medium, **L** large.
 
 Most of the Sept 2026 platform review
 ([docs/PLATFORM-REVIEW-2026-09.md](docs/PLATFORM-REVIEW-2026-09.md)) shipped in
-3.3.0 - see [Done in 3.3.0](#done-in-330) at the bottom. What's left:
+3.3.0, and 3.3.1-3.3.2 cleared most of what was left - see the Done lists at
+the bottom. What's left:
 
 ## Open
 
@@ -47,15 +48,6 @@ transparently farm delegatable tool calls out. Biggest moat, biggest risk (fight
 the client's own routing). The cascade is the tractable 80% - spike this, don't
 commit to it.
 
-### Parameters hosted reasoning models reject (S-M)
-
-GPT-6 (`gpt-6-astra`) returns a 400 on `temperature` and `max_tokens`, both of
-which houtini-lm always sends; the fleet works around it with a LiteLLM route
-using `additional_drop_params` (manual/models.md). Straight to OpenAI it would
-fail. For the GPT-5/6 and o-series families, send `max_completion_tokens` only
-and omit `temperature`/`top_p` - a per-family "parameter policy" beside
-`PROMPT_HINTS`. Verify against the provider's current docs (context7) first.
-
 ### Docker MCP Gateway: progress relay (S, upstream)
 
 Measured 2026-09-23: through `docker/mcp-gateway:latest` (July 2026 build)
@@ -65,13 +57,6 @@ current `main` has relay code (`pkg/mcp/mcp_client.go`); re-pull and re-run the
 probe. If it's still broken, file upstream. This is also the one argument for
 reviving native HTTP transport (below). Volume, pinned model and the 3.3.0 image
 are done on the fleet and documented in manual/docker.md.
-
-### Lazy re-profiling (S)
-
-`profileModelsAtStartup()` runs once at boot. Inference self-heals if the
-endpoint comes up later (the model list is re-fetched, and the backend is only
-cached on a *successful* probe), but profiling doesn't. Re-run it lazily when
-the cache is empty.
 
 ### Finish extracting from `index.ts` (M)
 
@@ -102,14 +87,48 @@ HF id), not the alias. Two findings to design around - model cards go stale
 deriver flags that as `ambiguous`). Derive automatically, verify against the
 runtime before trusting.
 
-### Model download and local store (M)
+### Local mode: hardware-aware model choice, download and loading (L) - scoped, leaning no
 
-From the 2026-08-10 Muse Glimmer test: vLLM's in-container loader stalled twice in
-anonymous HuggingFace rate-limit retries, fixed by a host-side `snapshot_download`
-and serving from a local path. Make it a houtini-lm capability: `download_model` /
-`list_local_models` with token-authenticated (`HF_TOKEN`), resumable pulls and a
-disk-space check first, and the local model store as a concept `discover` can
-report beside the router view.
+The question (2026-09-23): for people on LM Studio or Ollama rather than vLLM,
+should houtini-lm know what their hardware can run, recommend the right quant,
+download it and load it? Today it lists downloaded-but-not-loaded models (LM
+Studio's v0 API, Ollama's `/api/tags`) with their quant, suggests a better one
+when it exists, and never loads anything, because a load takes minutes and an
+MCP call times out at ~60s. It knows nothing about VRAM.
+
+What it would take:
+
+- **A configurable harness with hardware detection.** `nvidia-smi` for NVIDIA,
+  `rocm-smi` for AMD, unified memory on Apple Silicon, multi-GPU splits, and
+  Windows/WSL quirks, with a manual override for everything detection gets wrong.
+  The catch is that houtini-lm often isn't on the GPU's machine at all: a remote
+  endpoint, a GPU box on the LAN, a container. Probing the MCP host would report
+  the wrong hardware, so the numbers would have to come from the backend or from
+  config.
+- **Fit estimation.** Weights (the GGUF file size per quant, from the HF repo's
+  file listing) plus KV cache for the chosen context (layers x KV heads x head
+  dim x context x bytes) plus runtime overhead, so "Q4_K_M fits with 32k context,
+  Q6_K needs part-offloading".
+- **Download.** Multi-GB, resumable, `HF_TOKEN`-authenticated pulls with a
+  disk-space check. This absorbs the old "model download and local store" item
+  (from the 2026-08-10 Muse Glimmer test, where vLLM's in-container loader
+  stalled twice in anonymous HF rate-limit retries).
+- **Loading.** LM Studio can load over its API or `lms load`; Ollama loads on
+  first request. Either way it's fire-and-poll: start the load, return
+  immediately, let `discover` report progress.
+
+The case against, and why it's leaning no: LM Studio already shows which quants
+fit your hardware and handles GPU offload, and Ollama picks offload for you, so
+this rebuilds their UX inside an MCP server. It turns houtini-lm from "a client
+for any OpenAI-compatible endpoint" into a model manager with OS-specific code
+paths CI can't test. The OpenAI-compatible API is a sensible stopping point.
+
+The cheap middle ground, if anything (S): report what the backend already knows,
+with no hardware probing. Ollama's `/api/tags` gives each model's size and
+`/api/ps` gives `size_vram` for loaded models, so `list_models` could say "loaded
+partly on CPU, expect it to be slower" when `size_vram` is below `size`, and point
+at the VRAM table in GETTING-STARTED. Check the LM Studio API for the same
+fields before building it.
 
 ### Generator/critic pairs (M)
 
@@ -122,13 +141,20 @@ cascade above - design them together.
 
 ### Small
 
-- **Footer em-dashes (optional, touches snapshots).** Runtime output uses
-  em-dashes (`💰 Claude quota saved — …`, the reasoning-overhead line). If the
-  house spaced-hyphen convention extends to runtime output, normalise it along
-  with the shakedown snapshots and anything that asserts on the footer.
 - **Model knowledge base as data.** `MODEL_PROFILES` / `PROMPT_HINTS` are code;
   a data file would date more gracefully. 3.3.0 refreshed the contents
   (DeepSeek, Gemma, hosted GPT-5/6, Kimi K3) but not the format.
+
+## Done in 3.3.1 and 3.3.2
+
+`HOUTINI_LM_THINKING=on` honoured (PR #34) · grounding line scoped so literal
+models stop refusing open-ended writing · `discover` shows the version · the
+manual split by task (install, Docker, models, configuration) · parameter policy
+for OpenAI's hosted reasoning models (`max_completion_tokens` only, no sampling
+controls or chat-template toggles) · the hosted-OpenAI profile covers GPT-4 to
+GPT-6 and the o-series · stale "local model" descriptions on router aliases ·
+empty "Best for:" lines · lazy re-profiling when the endpoint was down at startup
+· spaced hyphens instead of em-dashes in runtime output.
 
 ## Done in 3.3.0
 

@@ -250,6 +250,45 @@ export function extractStreamError(json: unknown): string | undefined {
   return JSON.stringify(err);
 }
 
+// ── Hosted reasoning models ─────────────────────────────────────────
+
+/**
+ * OpenAI's hosted reasoning families (GPT-5, GPT-6, the o-series) reject
+ * parameters every other model accepts: `max_tokens` (deprecated, replaced by
+ * max_completion_tokens, which also covers reasoning tokens) and sampling
+ * controls like `temperature` - gpt-6-astra returns a 400 on both. Matches a
+ * bare or provider-prefixed name ("gpt-5.2", "openai/gpt-6-astra", "o4-mini");
+ * gpt-oss, the open-weight family, is deliberately not matched.
+ */
+export function isOpenAIReasoningModel(name: string | undefined): boolean {
+  if (!name) return false;
+  const bare = name.split('/').pop()!.toLowerCase();
+  return /^(?:gpt-[56]|o[1-9])(?:[.\-]|$)/.test(bare);
+}
+
+/**
+ * Strip what a hosted reasoning model rejects from a chat-completions body, in
+ * place. Keeps max_completion_tokens (the budget), drops max_tokens, the
+ * sampling set, and the open-weight chat-template toggles, which OpenAI
+ * rejects as unrecognised arguments.
+ */
+export function applyReasoningModelPolicy(body: Record<string, unknown>): string[] {
+  const dropped: string[] = [];
+  if (body.max_tokens !== undefined && body.max_completion_tokens === undefined) {
+    body.max_completion_tokens = body.max_tokens;
+  }
+  for (const key of [
+    'max_tokens', 'temperature', 'top_p', 'top_k', 'repeat_penalty',
+    'enable_thinking', 'chat_template_kwargs',
+  ]) {
+    if (key in body) {
+      delete body[key];
+      dropped.push(key);
+    }
+  }
+  return dropped;
+}
+
 // ── Thinking mode ───────────────────────────────────────────────────
 
 /**
@@ -302,7 +341,7 @@ export function buildSystemPrompt(opts: {
   const layers: string[] = [opts.base.trim()];
   layers.push(GROUNDING_LINE);
   if (opts.structuredOutput) {
-    layers.push('Return only valid JSON conforming to the requested schema — no prose, no markdown, no code fences.');
+    layers.push('Return only valid JSON conforming to the requested schema - no prose, no markdown, no code fences.');
   } else {
     if (opts.formatLine && opts.formatLine.trim()) layers.push(opts.formatLine.trim());
     if (opts.modelConstraint && opts.modelConstraint.trim()) layers.push(opts.modelConstraint.trim());

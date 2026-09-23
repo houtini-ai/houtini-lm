@@ -15,6 +15,8 @@ import {
   extractStreamError,
   buildSystemPrompt,
   resolveThinkingOverride,
+  isOpenAIReasoningModel,
+  applyReasoningModelPolicy,
   GROUNDING_LINE,
 } from '../dist/pure.js';
 
@@ -203,4 +205,30 @@ test('resolveThinkingOverride', () => {
   assert.equal(resolveThinkingOverride('auto', false), undefined);
   assert.equal(resolveThinkingOverride('', false), undefined);
   assert.equal(resolveThinkingOverride('maybe', false), undefined);
+});
+
+test('isOpenAIReasoningModel', () => {
+  for (const name of ['gpt-5', 'gpt-5.2', 'openai/gpt-6-astra', 'gpt-6-luna', 'o3', 'o4-mini', 'openai/o1']) {
+    assert.equal(isOpenAIReasoningModel(name), true, name);
+  }
+  for (const name of ['gpt-oss-120b', 'openai/gpt-oss-20b', 'gpt-4o-mini', 'gpt-4.1', 'qwen3-coder', 'local', '', undefined]) {
+    assert.equal(isOpenAIReasoningModel(name), false, String(name));
+  }
+});
+
+test('applyReasoningModelPolicy', () => {
+  const body = {
+    messages: [], stream: true, temperature: 0.3, max_tokens: 8000, max_completion_tokens: 8000,
+    top_p: 0.9, top_k: 40, repeat_penalty: 1.1, seed: 7,
+    enable_thinking: false, chat_template_kwargs: { enable_thinking: false },
+  };
+  const dropped = applyReasoningModelPolicy(body);
+  assert.deepEqual(dropped.sort(), ['chat_template_kwargs', 'enable_thinking', 'max_tokens', 'repeat_penalty', 'temperature', 'top_k', 'top_p']);
+  assert.equal(body.max_completion_tokens, 8000);
+  assert.equal(body.seed, 7);
+  assert.equal(body.stream, true);
+  // A body carrying only max_tokens keeps its budget as max_completion_tokens.
+  const legacy = { max_tokens: 4096 };
+  applyReasoningModelPolicy(legacy);
+  assert.deepEqual(legacy, { max_completion_tokens: 4096 });
 });
