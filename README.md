@@ -2,12 +2,14 @@
   <img src="https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/assets/logo.png" width="120" height="120" alt="Houtini LM" />
 </div>
 
-# @houtini/lm Houtini LM - Save Tokens by Offloading Tasks from Claude Code to Your Local LLM Server (LM Studio / Ollama), Openrouter or a Cloud API
+# Houtini LM (@houtini/lm) - Offload Work from Claude Code to a Local LLM, a Router or a Cheaper Cloud Model
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Known Vulnerabilities](https://snyk.io/test/github/houtini-ai/houtini-lm/badge.svg)](https://snyk.io/test/github/houtini-ai/houtini-lm)
+
+**Houtini LM is an MCP server that lets Claude (or any MCP client) hand bounded work to another model - a local LLM on your GPU, a LiteLLM router, OpenRouter or a cheap cloud API - while you carry on working in the AI platform you already like. It cuts your token bill, and it gives you a second model to review your code whenever you want one.**
 
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@houtini-ai/lm">
@@ -17,54 +19,64 @@
 
 > **Quick Navigation**
 >
-> [How it works](#how-it-works) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Performance tracking](#performance-tracking) | [Structured JSON output](#structured-json-output) | [Model routing](#model-routing) | [Self-test (shakedown)](#self-test-shakedown) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints) | [Developer guide](./DEVELOPER.md)
+> [Why use it](#why-use-houtini-lm) | [Install](#install) | [How it handles different models](#how-houtini-lm-handles-different-models) | [What to hand over](#what-to-hand-over) | [Tools](#the-tools) | [Reading the footer](#reading-the-footer) | [Configuration](#configuration) | [Endpoints](#compatible-endpoints) | [The manual](#the-manual)
 
-I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
+I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend went on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion, the sort of work that doesn't need Claude's reasoning or its tool access.
 
-Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API (LM Studio, Ollama, vLLM, DeepSeek, Groq, Cerebras, and OpenRouter's 300+ models through one endpoint). Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. No Claude quota burn. No rate limits. Private if local, cheap if cloud. The trade is wall-clock time: local inference is typically 3-30× slower than frontier models, so delegation wins on bounded, self-contained tasks rather than everything.
+So Claude stays the architect, doing the planning, the multi-file changes and the judgement calls, and houtini-lm passes the drafting to whatever model you've got running. That could be Qwen on a GPU box under your desk, a model behind a LiteLLM router, one of OpenRouter's 300+ models or DeepSeek at pennies per million tokens. Claude QAs everything that comes back.
 
-I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/).
+I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/) if you'd like the longer story.
 
-## The manual
+## Why use houtini-lm?
 
-This README is the overview. The depth lives in focused pages:
+The bottom line before we go deep: you keep your favourite AI platform, and you stop paying frontier prices for work that doesn't need a frontier model.
 
-| Page | What's in it |
-|---|---|
-| [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
-| [The tools, in depth](./manual/tools.md) | All eight tools: the parameters that matter, reading the footer, the max_tokens floor |
-| [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
-| [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
-| [LM Studio setup](./docs/SETUP-LMSTUDIO.md) · [Ollama setup](./docs/SETUP-OLLAMA.md) · [vLLM setup](./docs/SETUP-VLLM.md) | Backend guides, each with the traps that cause silent failures |
-| [vLLM backend notes](./docs/VLLM-BACKEND.md) | The deeper operational record: router topology, thinking toggles, token budgets |
-| [CLI mode](./docs/CLI-MODE.md) | Running houtini-lm as a command, not just an MCP server |
-| [Shakedown test](./docs/SHAKEDOWN.md) | The canonical end-to-end check - `npm run shakedown`, or paste the prompt into Claude and watch all eight tools run |
-| [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
+The obvious win is cost. When Claude delegates a review with `code_task_files`, the source files are read by the houtini-lm process and sent straight to the other model, so they never enter Claude's context window at all. Claude sends a short tool call and reads back a short answer. I benchmarked this on real TypeScript source files:
+
+| Task | Claude reads it directly | Delegated | Saved |
+|------|--------------|-----------|-------|
+| Code review (1,352 lines) | 14,466 tokens | 769 tokens | 95% |
+| Architecture review (2,022 lines) | 20,014 tokens | 983 tokens | 95% |
+| External repo review (581 lines) | 5,344 tokens | 741 tokens | 86% |
+| Code explanation (833 lines) | 8,678 tokens | 744 tokens | 91% |
+
+<p align="center">
+  <img src="docs/token-savings-chart.svg" alt="Bar chart of Claude token use with and without delegation across four review tasks, averaging 93.3% saved" />
+</p>
+
+That averages out at 93.3% saved across the session. To be fair, small tasks like a one-line question or a commit message don't save much, because the tool call overhead (around 250 tokens) is about the same size as the answer. Anything that involves reading files, which is most of a real coding session, pays for itself straight away. You can run the same benchmark against your own setup with `LM_STUDIO_URL=http://your-server:1234 node scripts/benchmark.mjs`.
+
+The less obvious win is a second opinion. A different model reads your code with different blind spots, and it costs you next to nothing to ask. As it happens, the 3.3.0 release of this repo is a decent example: I had Claude point houtini-lm at `gpt-6-astra` (through my LiteLLM router) and ask it to review the release's own 14,000-token diff. It came back with three real bugs - a router probe that cached a temporary 429 as a permanent "not a router", an output cap that got overwritten, and a race in the model list cache - and all three were fixed before the release shipped. Two of the three new test files were drafted the same way, then reviewed by Claude before commit.
+
+Code review is where this pays off hardest, because reviews are exactly the bounded, read-a-lot-write-a-little work that a cheaper model does well. From there the list keeps growing: test stubs, docstrings, commit messages, changelog drafts, format conversion, mock data, type definitions, embeddings for a RAG pipeline, a quick sanity check on a regex, brainstorming three approaches before Claude commits to one, and so on.
+
+The trade-off is wall-clock time. Local inference is typically 3-30x slower than a frontier model, so delegation wins on bounded, self-contained tasks rather than everything. A local model keeps your code private and costs nothing per token, a cloud model is cheap, and neither touches your Claude quota or its rate limits.
 
 ## How it works
 
 ```
-Claude Code (orchestrator)
+Claude Code, Claude Desktop, Cursor... (orchestrator)
    |
-   |-- Complex reasoning, planning, architecture --> Claude API (your tokens)
+   |-- Reasoning, planning, architecture, tool use --> your main AI platform
    |
-   +-- Bounded grunt work --> houtini-lm --HTTP/SSE--> Your local LLM (free)
-       . Boilerplate & test stubs          Qwen, Llama, Nemotron, GLM...
-       . Code review & explanations        LM Studio, Ollama, vLLM, llama.cpp
-       . Commit messages & docs            DeepSeek, Groq, Cerebras (cloud)
-       . Format conversion
-       . Mock data & type definitions
+   +-- Bounded grunt work --> houtini-lm --HTTP/SSE--> any OpenAI-compatible endpoint
+       . Code review & second opinions       LM Studio, Ollama, vLLM, SGLang, llama.cpp
+       . Test stubs & boilerplate            LiteLLM routers
+       . Commit messages & docs              OpenRouter (300+ models)
+       . Format conversion & mock data       DeepSeek, Groq, Cerebras, OpenAI...
        . Embeddings for RAG pipelines
 ```
 
-Claude's the architect. Your local model's the drafter. Claude QAs everything.
+Claude's the architect, the other model's the drafter, and Claude checks everything that comes back.
 
-## Quick start
+## Install
 
-> New to local models? See **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)** - installing LM Studio or a Docker endpoint, getting an OpenAI-compatible URL for houtini, what the smaller models are good at, and which models fit on 16/32/64/96/128 GB of VRAM.
->
-> Setting up a specific backend? Step-by-step guides, each with the traps that cause silent failures:
-> **[LM Studio](./docs/SETUP-LMSTUDIO.md)** (easiest, desktop) · **[Ollama](./docs/SETUP-OLLAMA.md)** (two commands, CLI) · **[vLLM](./docs/SETUP-VLLM.md)** (throughput, tool-calling, long context).
+You'll need two things before you start:
+
+- Node 22.5 or newer (22.13+ recommended - the model cache uses Node's built-in `node:sqlite`, and on older Node the server still runs, just without the cache)
+- An OpenAI-compatible endpoint: LM Studio, Ollama, vLLM, a LiteLLM router or a cloud API key
+
+New to local models? Start with [Getting started](./docs/GETTING-STARTED.md), which covers installing LM Studio or a Docker endpoint, what the smaller models are good at and which models fit on 16, 32, 64, 96 or 128 GB of VRAM. Each backend also has its own step-by-step guide with the traps that cause silent failures: [LM Studio](./docs/SETUP-LMSTUDIO.md) (easiest, desktop), [Ollama](./docs/SETUP-OLLAMA.md) (two commands) and [vLLM](./docs/SETUP-VLLM.md) (throughput, long context).
 
 ### Claude Code
 
@@ -74,17 +86,17 @@ claude mcp add houtini-lm -- npx -y @houtini/lm
 
 That's it. If LM Studio's running on `localhost:1234` (the default), Claude can start delegating straight away.
 
-### LLM on a different machine
+### A model on a different machine
 
-I've got a GPU box on my local network running Qwen 3 Coder Next in LM Studio. If you've got a similar setup, point the URL at it:
+I've got a GPU box on my local network, and if you've got a similar setup, point the URL at it:
 
 ```bash
 claude mcp add houtini-lm -e HOUTINI_LM_ENDPOINT_URL=http://192.168.1.50:1234 -- npx -y @houtini/lm
 ```
 
-### Cloud APIs
+### A cloud API
 
-Works with anything speaking the OpenAI format. DeepSeek at twenty-eight cents per million tokens, Groq for speed, Cerebras if you want three thousand tokens per second - whatever you fancy:
+Anything speaking the OpenAI format works. DeepSeek is very cheap, Groq is quick and Cerebras will give you thousands of tokens per second:
 
 ```bash
 claude mcp add houtini-lm \
@@ -95,7 +107,7 @@ claude mcp add houtini-lm \
 
 ### OpenRouter
 
-OpenRouter gives you 300+ models through one endpoint. Auto-detected from the URL - attribution headers, `reasoning.exclude`, and retry-with-backoff all kick in automatically:
+OpenRouter gives you 300+ models through one endpoint. houtini-lm spots it from the URL and switches on the attribution headers, `reasoning.exclude` and retry-with-backoff for you. Pin a model, because with a catalogue that size every candidate scores the same:
 
 ```bash
 claude mcp add houtini-lm \
@@ -105,9 +117,21 @@ claude mcp add houtini-lm \
   -- npx -y @houtini/lm
 ```
 
-### Claude Desktop
+### A LiteLLM router
 
-Drop this into your `claude_desktop_config.json`:
+This is how I run it at home, with local GPU models and hosted models behind one router. Point houtini-lm at the router and pin the alias you want unpinned work to go to:
+
+```bash
+claude mcp add houtini-lm \
+  -e HOUTINI_LM_ENDPOINT_URL=http://localhost:4000 \
+  -e HOUTINI_LM_API_KEY=your-litellm-key \
+  -e HOUTINI_LM_MODEL=your-alias \
+  -- npx -y @houtini/lm
+```
+
+### Claude Desktop and other MCP clients
+
+For Claude Desktop, drop this into your `claude_desktop_config.json`:
 
 ```json
 {
@@ -123,13 +147,19 @@ Drop this into your `claude_desktop_config.json`:
 }
 ```
 
-## Model discovery
+Any other MCP client (Cursor, VS Code, Codex, Gemini CLI and so on) takes the same command, arguments and environment variables in its own config format.
 
-This is where things get interesting. At startup, houtini-lm queries your LLM server for every model available - loaded and downloaded - then looks each one up on HuggingFace's free API to pull metadata: architecture, licence, download count, pipeline type. All of that gets cached in a local SQLite database (`~/.houtini-lm/model-cache.db`) so subsequent startups are instant.
+To check everything's wired up, ask Claude to run houtini-lm's `discover` tool. It tells you which endpoint it found, which model is active and how big its context window is.
 
-The result is that houtini-lm actually knows what your models are good at. Not just the name - the capabilities, the strengths, what tasks to send where. If you've got Nemotron loaded but a Qwen Coder sitting idle, it'll flag that. If someone on a completely different setup loads a Mistral model houtini-lm has never seen before, the HuggingFace lookup auto-generates a profile for it.
+## How houtini-lm handles different models
 
-Run `list_models` and you get the full picture:
+No two open source LLMs are the same. They differ in context window, output cap, prompt template, whether they think before they answer and how they report any of it, so a lot of houtini-lm's code is about working out what it's talking to and adjusting for it.
+
+### Model discovery at startup
+
+At startup houtini-lm asks your server for every model available, loaded and downloaded, then looks each one up on HuggingFace's free API for its architecture, licence, download count and chat template. All of that goes into a local SQLite cache (`~/.houtini-lm/model-cache.db`, refreshed every 7 days) so later startups are instant.
+
+For the families I know well there's a curated profile with specific strengths and weaknesses: Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS, DeepSeek, Gemma, Kimi and the hosted GPT-5/6 models. For anything else, the HuggingFace lookup generates a profile, so a Mistral model houtini-lm has never seen still gets described sensibly. Run `list_models` and you get the whole picture:
 
 ```
 Loaded models (ready to use):
@@ -151,203 +181,75 @@ Available models (downloaded, not loaded):
     HuggingFace: text-generation, 12.9K downloads, Apache-2.0
 ```
 
-For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's a curated profile built in with specific strengths and weaknesses. For everything else, the HuggingFace lookup fills the gaps. Cache refreshes every 7 days. Zero friction - the cache uses `node:sqlite` (Node's built-in SQLite, so no third-party native dependency and no build tools) in WAL mode, which lets several houtini-lm processes share one cache safely. Requires Node ≥ 22.5.
+### Per-family prompt hints
 
-## What gets offloaded
+Each model family carries its own temperature, output constraints and think-block flags, so GLM gets told "no preamble, no step-by-step reasoning" while Qwen Coder gets a low temperature for focused code output. Unknown models get sensible defaults.
 
-**Delegate to the local model** - bounded, well-defined tasks:
+### Thinking models
 
-| Task | Why it works locally |
-|------|---------------------|
-| Generate test stubs | Clear input (source), clear output (tests) |
-| Explain a function | Summarisation doesn't need tool access |
-| Draft commit messages | Diff in, message out |
-| Code review | Paste full source, ask for bugs |
-| Convert formats | JSON to YAML, snake_case to camelCase |
-| Generate mock data | Schema in, data out |
-| Write type definitions | Source in, types out |
-| Structured JSON output | Grammar-constrained, guaranteed valid |
-| Text embeddings | Semantic search, RAG pipelines |
-| Brainstorm approaches | Doesn't commit to anything |
+Thinking models spend part of their output budget on hidden reasoning before they answer, and left alone a small one at a default `max_tokens` will happily spend the whole budget thinking and hand back an empty reply. houtini-lm deals with that in three layers.
 
-**Keep on Claude** - anything that needs reasoning, tool access, or multi-step orchestration:
+First, it reads each model's chat template for thinking support, and models that support the `enable_thinking` toggle (Qwen3, Gemma 4, Nemotron, DeepSeek R1, GLM-4, gpt-oss) get thinking switched off at inference time. Second, the output budget is quietly inflated (4x, or plus 2,000 tokens, whichever is bigger) because some templates ignore the flag - Ollama's Qwen3 template hardcodes `enable_thinking=true`, for example. Third, reasoning is captured from `delta.reasoning_content` and `delta.reasoning`, inline `<think>` blocks are stripped from the answer, and if the reasoning still ate the whole budget you get the captured reasoning back rather than a silent empty body.
 
-- Architectural decisions
-- Reading/writing files
-- Running tests and interpreting results
-- Multi-file refactoring plans
-- Anything that needs to call other tools
+On OpenRouter it's simpler, because houtini-lm sends `reasoning: { exclude: true }` and the provider never sends the reasoning at all. Set `HOUTINI_LM_THINKING=off` if you want the no-think path forced on every call (useful when Claude does the reasoning and the other model only executes), and see [vLLM backend notes](./docs/VLLM-BACKEND.md) for the one case where you need it: vLLM served directly under an alias, where there's no real model name to detect.
 
-The tool descriptions are written to nudge Claude into planning delegation at the start of large tasks, not just using it when it happens to think of it.
+### Output budgets
 
-## Performance tracking
+When you don't pass `max_tokens`, houtini-lm gives the call 25% of the target model's context window, falling back to 16,384 when the context isn't reported. It never goes above the model's declared output cap or the room left in its context after your prompt, which means a hosted model with a 128k output cap doesn't get sent a request it'll reject.
 
-Every response includes a footer with real performance data - computed from the SSE stream, not from any proprietary API:
+There's also a floor, because MCP clients habitually pass tiny caps like 256 that strangle reasoning models mid-thought. Any `max_tokens` below 4,096 is ignored and the dynamic budget applies instead. If you deliberately want small outputs (micro-chunking on slow hardware, say) set `HOUTINI_LM_MIN_TOKENS=0`.
 
-```
----
-Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
-📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token — use this to gauge whether to delegate longer tasks.
-💰 Claude quota saved — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
-```
+### Routing and pinning
 
-The 📊 line only appears on the first measured call per model per session - it's a real benchmark from a genuine task, not a synthetic warmup. The 💰 line updates every call.
+With several models loaded, houtini-lm scores each one against the task type (code, chat, analysis, embedding) and picks the best. It never swaps models at runtime, because loading a model takes minutes and an MCP call times out long before that. If a better model is sitting downloaded but not loaded, the footer suggests it instead.
 
-When the active model returns `completion_tokens_details.reasoning_tokens` (DeepSeek R1, LM Studio with "Separate reasoning_content" enabled, OpenAI reasoning models), the token block splits into `reasoning / visible` so you can see when a thinking model is burning its output budget on hidden reasoning.
-
-### Lifetime persistence
-
-Per-model performance and token counts persist across Claude Desktop restarts in `~/.houtini-lm/model-cache.db`. This means:
-
-- From call 1 of a new session, `discover` shows **historical** tok/s and TTFT for the loaded model - not "not yet benchmarked".
-- The 💰 counter shows both session and lifetime totals.
-- The `code_task_files` pre-flight estimator uses measured per-model prefill rate to refuse obviously-too-large inputs with a clear diagnostic, instead of letting them silently hang against the MCP client timeout.
-
-The data is workstation-specific - that's intentional. Routing decisions should reflect your actual hardware, not a synthetic benchmark.
-
-The `discover` tool shows per-model averages across both scopes:
-
-```
-Measured speed (session):  58.0 tok/s · TTFT 485ms (1 call)
-Measured speed (lifetime on this workstation): 46.9 tok/s · TTFT 2641ms (214 calls, last used 2026-04-20)
-```
-
-In practice, Claude delegates more aggressively the longer a session runs. After about 5,000 offloaded tokens, it starts hunting for more work to push over. Reinforcing loop.
-
-## Model routing
-
-If you've got multiple models loaded (or downloaded), houtini-lm picks the best one for each task automatically. Each model family has per-family prompt hints - temperature, output constraints, and think-block flags - so GLM gets told "no preamble, no step-by-step reasoning" while Qwen Coder gets a low temperature for focused code output.
-
-The routing scores loaded models against the task type (code, chat, analysis, embedding). If the best loaded model isn't ideal for the task, you'll see a suggestion in the response footer pointing to a better downloaded model. No runtime model swapping - model loading takes minutes, so houtini-lm suggests rather than blocks.
-
-Supported model families with curated prompt hints: GLM-4, Qwen3 Coder, Qwen3, LLaMA 3, Nemotron, Granite, GPT-OSS, Nomic Embed. Unknown models get sensible defaults.
-
-### Overriding the router
-
-Scoring works well when there are a handful of loaded models. On providers with large catalogues (OpenRouter lists 300+ models, all reporting as routable) unknown models all score zero and ties break on iteration order, so you probably want to pin explicitly. Two ways, in precedence order:
-
-1. **Per-call** - pass `model: "nvidia/nemotron-3-nano-30b-a3b:free"` to any of `chat` / `custom_prompt` / `code_task` / `code_task_files`. Overrides everything else.
-2. **Per-process** - set `HOUTINI_LM_MODEL` in the environment. Applies to every tool call from that server process. Overridden by the per-call parameter.
-
-Leave both unset and the router picks.
+Scoring works well with a handful of models. On a big catalogue, unknown models all score the same and ties go to whichever is listed first, so you'll want to pin. Pass `model` on any individual call, or set `HOUTINI_LM_MODEL` for every call from that server process; the per-call parameter wins, and leaving both unset lets the router pick.
 
 ### Behind a LiteLLM router
 
-Point houtini-lm at a [LiteLLM](https://docs.litellm.ai) router and it reads the router's `/model/info` as well as `/v1/models`. That's where the useful facts live: which real model sits behind each alias (`local` → `qwen3.6-27b`), what kind of model it is, and - for hosted models - the true context window and output cap. So houtini-lm:
+Point houtini-lm at a [LiteLLM](https://docs.litellm.ai) router and it reads the router's `/model/info` alongside `/v1/models`. That's where the useful facts live: which real model sits behind each alias (my `local` alias is `qwen3.6-27b`), what kind of model it is, and for hosted models the true context window and output cap. So each alias is profiled as the model it actually is, a thinking model behind an alias gets the no-think toggle automatically, every call is sized from that model's own limits, and the TTS, image, video, realtime and moderation models a real router lists by the dozen are left out of `discover`, `list_models` and routing. Routers usually front rate-limited cloud tiers, so 429s are retried with backoff too.
 
-- profiles each alias as the model it actually is, which also means a thinking model behind an alias gets the no-think toggle automatically;
-- sizes every call's budget from *that* model's limits, never above its declared output cap;
-- leaves TTS, image, video, realtime and moderation models out of `discover`, `list_models` and routing entirely - a real router lists dozens of them;
-- retries 429s with backoff, because a router usually fronts rate-limited cloud tiers.
+One more thing to watch out for: if your router lists a local GPU model first, that's where unpinned work lands. Pin `HOUTINI_LM_MODEL` to the alias you actually want, and `discover` will warn you when it spots the problem.
 
-Two things worth doing on a router. Pin a model (`HOUTINI_LM_MODEL`), because every alias scores the same and ties go to whichever is listed first - `discover` warns you when that's happening. And if your router puts a local GPU model first, that's where unpinned work lands unless you say otherwise.
+### Request queuing
 
-## Tools
+A single-GPU host can only serve one request at a time, so on local providers houtini-lm queues parallel tool calls and runs them one at a time, which gives each call its full timeout rather than stacking them. On remote providers the queue is skipped because the upstream handles parallelism itself. If you run vLLM, TGI or SGLang, which batch natively, set `HOUTINI_LM_SERIALISE=0` to turn the queue off.
 
-### `chat`
+## What to hand over
 
-The workhorse. Send a task, get an answer. The description includes planning triggers that nudge Claude to identify offloadable work when it's starting a big task.
+The best candidates are bounded and well defined, with a clear input and a clear output:
 
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `message` | yes | - | The task. Be specific about output format. |
-| `system` | no | - | Persona - "Senior TypeScript dev" not "helpful assistant" |
-| `temperature` | no | 0.3 | 0.1 for code, 0.3 for analysis, 0.7 for creative |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). Pass a number to cap it. |
-| `json_schema` | no | - | Force structured JSON output conforming to a schema |
-| `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
+| Task | Why it works on another model |
+|------|---------------------|
+| Code review | Paste the full source (or pass the paths), ask for bugs |
+| A second opinion on a plan | Doesn't commit to anything, costs next to nothing |
+| Generate test stubs | Source in, tests out |
+| Explain a function | Summarisation doesn't need tool access |
+| Draft commit messages | Diff in, message out |
+| Convert formats | JSON to YAML, snake_case to camelCase |
+| Generate mock data | Schema in, data out |
+| Write type definitions | Source in, types out |
+| Structured JSON output | Grammar-constrained, valid by construction |
+| Text embeddings | Semantic search, RAG pipelines |
 
-### `custom_prompt`
+Anything that needs reasoning across the codebase, tool access or multi-step orchestration stays on Claude: architectural decisions, reading and writing files, running tests and interpreting the results, multi-file refactoring plans and anything that has to call other tools. The tool descriptions are written to nudge Claude into planning delegation at the start of a big task, rather than only using it when it happens to remember.
 
-Three-part prompt: system, context, instruction. Keeping them separate prevents context bleed - consistently outperforms stuffing everything into one message, especially with local models. I tested this properly one weekend - took the same batch of review tasks and ran them both ways. Splitting things into three parts won every round.
+## The tools
 
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `instruction` | yes | - | What to produce. Under 50 words works best. |
-| `system` | no | - | Persona + constraints, under 30 words |
-| `context` | no | - | Complete data to analyse. Never truncate. |
-| `temperature` | no | 0.3 | 0.1 for review, 0.3 for analysis |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
-| `json_schema` | no | - | Force structured JSON output |
-| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
+There are eight of them. The full parameter reference is in [The tools, in depth](./manual/tools.md).
 
-### `code_task`
+| Tool | What it's for |
+|------|---------------|
+| `chat` | The workhorse. Send a task, get an answer. |
+| `custom_prompt` | System, context and instruction kept separate, which consistently beats stuffing everything into one message on local models. I tested this properly one weekend with the same batch of review tasks run both ways, and the three-part version won every round. |
+| `code_task` | Code analysis with a code-tuned system prompt and per-family temperature. |
+| `code_task_files` | Like `code_task`, but houtini-lm reads the files from disk itself, so the source never passes through Claude's context. Unreadable files are reported inline rather than sinking the call, and a pre-flight estimator refuses inputs that measured data says would time out. |
+| `embed` | Text embeddings via `/v1/embeddings` (Nomic Embed is a solid choice). |
+| `discover` | Health check: endpoint, active model, context window, output cap, and measured speed once there's a real call to measure. |
+| `list_models` | Everything on the server, loaded and downloaded, with profiles. |
+| `stats` | Session and lifetime offload totals and per-model performance, without the model catalogue. |
 
-Built for code analysis. Pre-configured system prompt with temperature and output constraints tuned per model family via the routing layer.
-
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `code` | yes | - | Complete source code. Never truncate. |
-| `task` | yes | - | "Find bugs", "Explain this", "Write tests" |
-| `language` | no | - | "typescript", "python", "rust", etc. |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
-| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
-
-### `code_task_files`
-
-Like `code_task`, but the local LLM reads files directly from disk - source never passes through the MCP client's context window. Use this when reviewing multiple related files, or a single large file that's awkward to paste. Files are read in parallel with `Promise.allSettled`, so one unreadable file doesn't sink the call; failures are surfaced inline with the reason.
-
-Includes a **pre-flight prefill estimator**: if measured per-model data from the SQLite cache shows the input would exceed the MCP client's ~60s request-timeout during prompt processing, the call is refused early with a concrete diagnostic (estimated prefill seconds, tokens, and sample-count) instead of letting it silently hang. First-time callers are never refused - the estimator only fires after ≥2 measured samples.
-
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `paths` | yes | - | Array of absolute file paths. Relative paths are rejected. |
-| `task` | yes | - | "Find bugs across these files", "Audit this module" |
-| `language` | no | - | "typescript", "python", "rust", etc. |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
-| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
-
-### `embed`
-
-Generate text embeddings via the OpenAI-compatible `/v1/embeddings` endpoint. Requires an embedding model to be available - Nomic Embed is a solid choice. Returns the vector, dimension count, and usage stats.
-
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `input` | yes | - | Text to embed |
-| `model` | no | auto | Embedding model ID |
-
-### `discover`
-
-Health check and speed readout. Returns model name, context window, capability profile, connection latency (labelled explicitly - this is the `/v1/models` fetch round-trip, *not* inference speed), and the active model's measured tok/s and TTFT averaged over the session. Before any real call has run, measured speed shows as "not yet benchmarked - will be captured on the first real call" rather than inventing a number from a synthetic probe. Call before delegating if you're not sure the LLM's available, or when deciding whether a longer task is worth offloading.
-
-### `list_models`
-
-Lists everything on the LLM server - loaded and downloaded - with full metadata: architecture, quantisation, context window, capabilities, and HuggingFace enrichment data. Shows capability profiles describing what each model is best at, so Claude can make informed delegation decisions.
-
-### `stats`
-
-Compact markdown dump of your offload stats - session and lifetime totals, per-model performance history, reasoning-token overhead - without the model catalog that `discover` prints. Cheap to call repeatedly to watch the 💰 counter climb.
-
-| Parameter | Required | Default | What it does |
-|-----------|----------|---------|-------------|
-| `model` | no | - | Filter output to a single model ID. Omit for all models ever used on this workstation. |
-
-Example output:
-
-```
-## Houtini LM stats
-**Endpoint**: http://gpu-box:1234 (LM Studio)
-**First call on this workstation**: 2026-04-14
-
-### Totals
-| Scope    | Calls | Prompt tokens | Completion tokens | Total tokens |
-| Session  |     7 |         3,100 |             1,183 |        4,283 |
-| Lifetime |   213 |             — |                 — |      147,432 |
-
-### Per-model performance
-| Model                    | Scope    | Calls | Avg TTFT | Avg tok/s | Prompt tokens | Last used  |
-| nvidia/nemotron-3-nano   | session  |     7 |    485   |      58.0 | —             | —          |
-| nvidia/nemotron-3-nano   | lifetime |   213 |   2641   |      46.9 |       89,320  | 2026-04-20 |
-
-### Reasoning-token overhead (lifetime)
-124 / 47,183 completion tokens spent on hidden reasoning (0.3%). Low — reasoning is effectively suppressed.
-```
-
-The reasoning-token overhead line is the canary for "is `reasoning_effort` actually being honoured on this model and this backend?" - above ~30% is a signal to investigate.
-
-## Structured JSON output
-
-Both `chat` and `custom_prompt` accept a `json_schema` parameter that forces the response to conform to a JSON Schema. LM Studio uses grammar-based sampling to guarantee valid output - no hoping the model remembers to close its brackets.
+The inference tools (`chat`, `custom_prompt`, `code_task`, `code_task_files`) all take an optional `model` to pin the call, `max_tokens`, and sampling controls (`temperature`, `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty`). `chat` and `custom_prompt` also take a `json_schema`, which forces the answer to conform to a JSON Schema; on LM Studio that's grammar-based sampling, so there's no hoping the model remembers to close its brackets:
 
 ```json
 {
@@ -375,33 +277,38 @@ Both `chat` and `custom_prompt` accept a `json_schema` parameter that forces the
 }
 ```
 
-## Getting good results from local models
+Each inference result also carries a `structuredContent` block (model, tokens, timing, quality flags) for clients and scripts that would rather read JSON than parse the footer.
 
-Qwen, Llama, Nemotron, GLM - they score brilliantly on coding benchmarks now. The gap between a good and bad result is almost always prompt quality, not model capability. I've spent a fair bit of time on this.
+## Reading the footer
 
-**Send complete code.** Local models hallucinate details when you give them truncated input. If a file's too large, send the relevant function - not a snippet with `...` in the middle.
+Every response ends with a footer computed from the SSE stream itself:
 
-**Be explicit about output format.** "Return a JSON array" or "respond in bullet points" - don't leave it open-ended. Smaller models need this.
+```
+---
+Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
+📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token — use this to gauge whether to delegate longer tasks.
+💰 Claude quota saved — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
+```
 
-**Set a specific persona.** "Expert Rust developer who cares about memory safety" gets noticeably better results than "helpful assistant."
+The first-call line appears once per model per session, and it's a benchmark from a real task rather than a synthetic warm-up. The savings line updates every call. When a model reports its reasoning tokens, the token count splits into reasoning and visible, so you can see when a thinking model is burning budget on hidden reasoning.
 
-**State constraints.** "No preamble", "reference line numbers", "max 5 bullet points" - tell the model what *not* to do as well as what to do.
+When something went wrong, a quality line says so: `TRUNCATED` for a partial result (a stalled connection gives you what arrived rather than a timeout error), `hit-max-tokens` when the budget ran out, `think-blocks-stripped` when reasoning was removed and `tokens-estimated` when the server didn't report usage. Clean output gets no quality line at all.
 
-**Include surrounding context.** For code generation, send imports, types, and function signatures - not just the function body.
+Per-model speed and token counts persist in `~/.houtini-lm/model-cache.db`, so `discover` shows your measured tok/s and time to first token from the first call of a new session, and `stats` gives you the lifetime totals. That data is specific to your workstation on purpose, because delegation decisions should reflect your hardware rather than somebody else's benchmark. In practice, Claude delegates more the longer a session runs; after about 5,000 offloaded tokens it starts hunting for more work to push over.
 
-**One call at a time.** As of v2.8.0, houtini-lm enforces this automatically with a request semaphore. Parallel calls queue up and run one at a time, so each gets the full timeout budget instead of stacking.
+## Getting good results
 
-## Self-test (shakedown)
+Qwen, Llama, Nemotron and GLM score brilliantly on coding benchmarks now, and the gap between a good and a bad result is almost always the prompt rather than the model. I've spent a fair bit of time on this, and the short version goes like this. Send complete code, because local models make up details when the input is truncated, so send the whole function rather than a snippet with `...` in the middle. Be explicit about the output format ("return a JSON array"), since smaller models need it. Give the model a specific persona ("expert Rust developer who cares about memory safety" does noticeably better than "helpful assistant"), state what not to do as well as what to do, and for code generation include the imports, types and signatures around the function body.
 
-The canonical way to verify an install and get an honest read on what the loaded model can do on your hardware:
+Keep long jobs in chunks, too. Most MCP clients time a tool call out at around 60 seconds, and although houtini-lm sends a progress notification on every streamed chunk to keep the clock reset, not every client or gateway passes those through. Calls of roughly 500-900 output tokens finish comfortably inside the limit. [The craft of delegation](./manual/delegation.md) goes much deeper, including the verbatim-echo pattern I use for fixes.
+
+## Check your install
 
 ```bash
 npm run shakedown
 ```
 
-This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) - an end-to-end test that exercises seven of the eight tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` is not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
-
-Sample output tail:
+[`scripts/shakedown.mjs`](./scripts/shakedown.mjs) runs seven of the eight tools end to end (everything except `stats`) and prints a table of real TTFT, tok/s, token counts and reasoning split for each call. It takes under a minute on a decent rig:
 
 ```
 Summary
@@ -418,61 +325,7 @@ Summary
    Tokens offloaded: 10,915 (prompt: 7,289, completion: 3,626, reasoning: 0)
 ```
 
-Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./docs/SHAKEDOWN.md) into a Claude session that has houtini-lm attached - Claude will drive the seven steps and write you a report on output quality as well as performance.
-
-## Think-block handling
-
-Thinking models burn part of their output budget on invisible reasoning before producing an answer. Left alone, small models at default `max_tokens` will happily spend the whole budget reasoning and return an empty body. How houtini-lm handles this depends on whether the provider exposes reasoning as a separate channel or in-band.
-
-**Local backends (LM Studio, Ollama, vLLM)** - reasoning arrives inline on the content channel or via `delta.reasoning_content` / `delta.reasoning`:
-
-1. **Suppression at source** - at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (Qwen3, Gemma 4, Nemotron, DeepSeek R1, GLM-4, gpt-oss) get thinking disabled at inference time. Detection is automatic via chat-template inspection plus arch/id heuristics, so Ollama tags like `qwen3:4b` are recognised too.
-2. **Budget inflation** - `max_tokens` is silently inflated (×4 or +2000, whichever is bigger) so reasoning can't starve the content channel. Essential for backends like Ollama where the Qwen3 Jinja template hardcodes `enable_thinking=true` and ignores the API flag.
-3. **Reasoning capture + stripping** - reasoning is captured from both `delta.reasoning_content` (LM Studio, DeepSeek R1, Nemotron) and `delta.reasoning` (Ollama). Inline `<think>...</think>` blocks on the content channel are stripped after assembly - balanced pairs, orphan openers, and orphan closers are all handled. When reasoning exhausts the budget entirely, the captured reasoning text is returned as a last-ditch fallback so the caller sees *something* rather than a silent empty body.
-
-**OpenRouter** - handles reasoning as a structured per-request parameter and a separate `message.reasoning` response field. Houtini-lm sends `reasoning: { exclude: true }` on every OpenRouter call so thinking models (Nemotron, DeepSeek R1, Qwen3, Claude thinking, gpt-oss, etc.) are normalised to text-only output at the provider level. Budget inflation still fires because some upstream providers bill reasoning tokens against the cap before `exclude` filtering. No stripping is needed - the provider never sends the reasoning in the first place.
-
-The quality footer flags `think-blocks-stripped` when stripping occurred, `reasoning-only` when the fallback fired, and `hit-max-tokens` when the budget ran out - so you know exactly what happened even when the output looks clean.
-
-## Quality metadata
-
-Every response includes structured quality signals in the footer so Claude (or any orchestrator) can make informed trust decisions:
-
-```
----
-Model: qwen3-coder-30b-a3b | 413→81 tokens | TTFT: 2355ms, 15.0 tok/s, 5.4s | Quality: think-blocks-stripped, tokens-estimated
-💰 Claude quota saved this session: 494 tokens across 1 offloaded call
-```
-
-Flags include: `TRUNCATED` (partial result), `think-blocks-stripped`, `tokens-estimated` (usage data was missing, estimated from content length), `hit-max-tokens`. When no flags fire, the quality line is omitted - clean output, nothing to report.
-
-## Session metrics resource
-
-The `houtini://metrics/session` MCP resource exposes cumulative offload stats as JSON. Claude can read this proactively to make smarter delegation decisions based on actual session performance:
-
-```json
-{
-  "session": {
-    "totalCalls": 14,
-    "promptTokens": 3200,
-    "completionTokens": 5250,
-    "totalTokensOffloaded": 8450
-  },
-  "perModel": {
-    "qwen3-coder-30b-a3b": {
-      "calls": 14,
-      "avgTtftMs": 2100,
-      "avgTokPerSec": 15.2
-    }
-  }
-}
-```
-
-## Request serialisation
-
-On **local** providers (LM Studio, Ollama, vLLM, llama.cpp) parallel MCP tool calls are automatically queued and run one at a time. A single-GPU host can only serve one request at a time anyway - without the semaphore, parallel calls stack timeouts and waste the generation budget.
-
-On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything detected as a non-local backend) the semaphore is skipped - the upstream handles parallelism natively and serialising artificially would throttle you. This is automatic; you don't need to configure it.
+If you'd rather have a quality review than latency numbers, paste [SHAKEDOWN.md](./docs/SHAKEDOWN.md) into a Claude session with houtini-lm attached and Claude will drive the same steps and write you a report on the output as well as the speed.
 
 ## Configuration
 
@@ -480,68 +333,64 @@ On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything dete
 |----------|---------|-------------|
 | `HOUTINI_LM_ENDPOINT_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API. Legacy alias: `LM_STUDIO_URL`. |
 | `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. Legacy aliases: `LM_STUDIO_PASSWORD`, `LM_PASSWORD`, `OPENROUTER_API_KEY`. |
-| `HOUTINI_LM_MODEL` | *(auto-detect)* | Model identifier - leave blank to use whatever's loaded. Legacy alias: `LM_STUDIO_MODEL`. |
-| `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation; `litellm` for router handling (429 backoff). Otherwise auto-detected - OpenRouter from the URL, LiteLLM from its `/model/info` endpoint. |
-| `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it (`discover` says when it's guessing). Legacy alias: `LM_CONTEXT_WINDOW`. |
-| `HOUTINI_LM_RETRY_RATELIMIT` | *(off)* | Set to `1` to retry 429/5xx with jittered backoff on any backend. On by default for OpenRouter and LiteLLM routers; use this for other proxies that front a rate-limited API. |
-| `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:`/`,`-separated allowlist of directory roots `code_task_files` may read from (symlink-resolved). Unset = any absolute path. |
+| `HOUTINI_LM_MODEL` | *(auto-detect)* | Pin a model for every call from this process. Leave blank to let routing pick. Legacy alias: `LM_STUDIO_MODEL`. |
+| `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider handling: `openrouter` (attribution headers, `reasoning.exclude`, no serialisation) or `litellm` (router handling, 429 backoff). Otherwise OpenRouter is detected from the URL and LiteLLM from its `/model/info` endpoint. |
+| `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window when the API doesn't report one (`discover` says when it's guessing). Legacy alias: `LM_CONTEXT_WINDOW`. |
+| `HOUTINI_LM_RETRY_RATELIMIT` | *(off)* | Set to `1` to retry 429/5xx with jittered backoff on any backend. Already on for OpenRouter and LiteLLM routers; use it for other proxies that front a rate-limited API. |
+| `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:` or `,` separated allowlist of directories `code_task_files` may read from (symlinks resolved). Unset means any absolute path. |
 | `HOUTINI_LM_MAX_FILE_MB` | `10` | Per-file size cap for `code_task_files`. |
-| `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable just the cross-process inference lock (keeps the in-process semaphore). |
-| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to disable inference serialisation entirely (both the in-process semaphore and the cross-process lock). Use for backends that batch natively (vLLM, TGI, SGLang) where one-at-a-time only throttles throughput. |
-| `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Values below the floor are ignored and the dynamic budget (25% of the model's context window) applies - MCP clients habitually pass tiny caps like 256 that strangle reasoning models. Set to `0` to honour any value (e.g. deliberate micro-chunking on slow hardware). |
-| `HOUTINI_LM_THINKING` | `auto` | Thinking control: `auto` detects thinking support from the model, `off` forces the no-think path for every call, `on` forces thinking. Use `off` when an orchestrator (e.g. Claude) does the reasoning and the local model only executes - and **required for vLLM served directly under an alias** (e.g. `--served-model-name coder-next`), where detection can't identify the real model so the no-think toggle would otherwise never fire and the answer would come back empty (in `reasoning_content`). Behind a LiteLLM router the alias is resolved to the real model automatically, so `auto` works there. Only ever suppresses thinking; never fabricates it. |
-
-**Per-request sampling** - `chat`, `custom_prompt`, `code_task`, and `code_task_files` also accept optional `seed`, `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, and `presence_penalty`. Out-of-range values are ignored; the backend default applies.
-
-> **Requires Node ≥ 22.5** (≥ 22.13 recommended) - the model cache uses Node's built-in `node:sqlite`. On older Node the server still runs, without the cache.
+| `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable just the cross-process inference lock (the in-process queue stays). |
+| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to disable the queue entirely, for backends that batch natively (vLLM, TGI, SGLang). |
+| `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`; anything lower is ignored in favour of the dynamic budget. Set to `0` to honour any value. |
+| `HOUTINI_LM_THINKING` | `auto` | `auto` detects thinking support per model, `off` forces the no-think path on every call, `on` forces thinking. Required as `off` for vLLM served directly under an alias; behind a LiteLLM router the alias is resolved and `auto` works. It only ever suppresses thinking, never fabricates it. |
 
 ## Compatible endpoints
 
-Works with anything that speaks the OpenAI `/v1/chat/completions` API:
+Anything that speaks the OpenAI `/v1/chat/completions` API will work:
 
 | What | URL | Notes |
 |------|-----|-------|
-| [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config. Rich metadata via v0 API. **[Setup guide →](./docs/SETUP-LMSTUDIO.md)** |
-| [Ollama](https://ollama.com) | `http://localhost:11434` | Set `HOUTINI_LM_ENDPOINT_URL`. Thinking models (qwen3, deepseek-r1) handled transparently - reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
-| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models from one endpoint. Auto-detected - sends attribution headers, uses `reasoning.exclude` for thinking models, retries 429/5xx with jittered backoff, parallel requests allowed. |
-| [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API. **[Setup guide →](./docs/SETUP-VLLM.md)** |
-| [LiteLLM](https://docs.litellm.ai) router | `http://localhost:4000` | Auto-detected via `/model/info`: aliases resolved to real models, true context and output limits, non-chat models filtered out, 429 backoff. See [Behind a LiteLLM router](#behind-a-litellm-router). |
+| [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config, rich metadata via its v0 API. [Setup guide](./docs/SETUP-LMSTUDIO.md) |
+| [Ollama](https://ollama.com) | `http://localhost:11434` | Thinking models (qwen3, deepseek-r1) handled via Ollama's `delta.reasoning` channel. [Setup guide](./docs/SETUP-OLLAMA.md) |
+| [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API. [Setup guide](./docs/SETUP-VLLM.md) |
+| [SGLang](https://github.com/sgl-project/sglang) | `http://localhost:30000` | Good for repeated-context work. See [Getting started](./docs/GETTING-STARTED.md) |
+| [LiteLLM](https://docs.litellm.ai) router | `http://localhost:4000` | Auto-detected: aliases resolved, real limits read, non-chat models filtered, 429 backoff |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
-| [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | 28c/M input tokens |
-| [Groq](https://groq.com) | `https://api.groq.com/openai` | ~750 tok/s |
-| [Cerebras](https://cerebras.ai) | `https://api.cerebras.ai` | ~3000 tok/s |
-| Any OpenAI-compatible API | Any URL | Set URL + password |
+| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models, auto-detected, parallel requests allowed |
+| [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | Very cheap per token |
+| [Groq](https://groq.com) | `https://api.groq.com/openai` | Fast |
+| [Cerebras](https://cerebras.ai) | `https://api.cerebras.ai` | Very fast |
+| Any OpenAI-compatible API | Any URL | Set the URL and API key |
 
-## Streaming and timeouts
+## The manual
 
-All inference uses Server-Sent Events streaming. Tokens arrive incrementally. Since v2.9.0, houtini-lm sends MCP progress notifications on every streamed chunk - including during the thinking phase for reasoning models - which resets the SDK's 60-second client timeout. A 5-minute soft timeout acts as a safety net so a wedged connection can't hold a tool call open indefinitely; as long as tokens keep flowing, the per-chunk progress keeps the client side alive up to that ceiling.
+This README is the overview, and the depth lives in these pages:
 
-If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so Claude knows to treat the output with appropriate caution.
-
-## Architecture
-
-```
-index.ts          Main MCP server - tools, streaming, session tracking
-model-cache.ts    SQLite-backed model profile cache (node:sqlite, WAL)
-                  Auto-profiles models via HuggingFace API at startup
-                  Persists to ~/.houtini-lm/model-cache.db
-
-Inference:        POST /v1/chat/completions  (OpenAI-compatible, works everywhere)
-Model metadata:   GET  /api/v0/models        (LM Studio, falls back to /v1/models)
-Embeddings:       POST /v1/embeddings        (OpenAI-compatible)
-```
+| Page | What's in it |
+|---|---|
+| [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
+| [The tools, in depth](./manual/tools.md) | All eight tools: the parameters, reading the footer, the max_tokens floor |
+| [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it, the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
+| [Troubleshooting](./manual/troubleshooting.md) | Symptom > cause > fix for empty responses, timeouts, context-length 400s, queuing and routers |
+| [LM Studio](./docs/SETUP-LMSTUDIO.md), [Ollama](./docs/SETUP-OLLAMA.md) and [vLLM](./docs/SETUP-VLLM.md) setup | Backend guides, each with the traps that cause silent failures |
+| [vLLM backend notes](./docs/VLLM-BACKEND.md) | Router topology, thinking toggles, token budgets and what houtini-lm reads from a router |
+| [Shakedown test](./docs/SHAKEDOWN.md) | The end-to-end check, as a script or as a prompt for Claude |
+| [CLI mode](./docs/CLI-MODE.md) | Scoped, not built yet: running houtini-lm as a command without the MCP timeout |
+| [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
 
 ## Development
 
 ```bash
-git clone https://github.com/houtini-ai/lm.git
-cd lm
+git clone https://github.com/houtini-ai/houtini-lm.git
+cd houtini-lm
 npm install
-npm run build
-npm run shakedown    # end-to-end self-test + benchmark
+npm test             # build + unit tests
+npm run shakedown    # end-to-end self-test against a live endpoint
 ```
 
-See [DEVELOPER.md](./DEVELOPER.md) for architecture, internals, the reasoning-model pipeline, backend detection, the SQLite performance cache, and instructions for adding new tools or backends.
+[DEVELOPER.md](./DEVELOPER.md) covers the architecture, the reasoning-model pipeline, backend detection, the SQLite performance cache and how to add new tools or backends. If you find a model family houtini-lm handles badly, open an issue with the `discover` output and I'll take a look.
+
+Good luck, and let me know how you get on!
 
 ## Licence
 
