@@ -37,6 +37,24 @@ import {
 import { acquireInferenceLock } from './inference-lock.js';
 import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
+import {
+  CHARS_PER_TOKEN,
+  autoOutputBudget,
+  capOutputBudget,
+  inflateForThinking,
+  isConfidentPrefillEstimate,
+  extractSamplingParams,
+  validTemperature,
+  validMaxTokens as validMaxTokensWithFloor,
+  toResponseFormat,
+  redactUrl,
+  parseRetryAfter,
+  extractStreamError,
+  buildSystemPrompt,
+  type SamplingParams,
+  type ResponseFormat,
+} from './pure.js';
+import { parseModelInfo, classifyMode, isWildcardAlias, type RouterModelInfo } from './litellm.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -67,6 +85,8 @@ const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
 const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
 const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
+const DISCOVER_MODEL_LIMIT = 12;             // discover is meant to be cheap; list_models shows the full catalogue
+const LIST_MODELS_DETAIL_LIMIT = 30;         // above this, list_models switches to one line per model
 const STREAM_PROGRESS_THROTTLE_MS = 500;     // min gap between per-delta streaming progress pings — decoupled from token rate so a fast model can't flood stdio
 const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
@@ -109,33 +129,6 @@ async function readGuardedFile(p: string): Promise<string> {
     throw new Error(`file is ${(info.size / 1024 / 1024).toFixed(1)} MB, over the ${(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)} MB limit (set HOUTINI_LM_MAX_FILE_MB to raise)`);
   }
   return readFile(real, 'utf8');
-}
-
-/**
- * Redact secrets embedded in an endpoint URL before echoing it to the client
- * or logs. Strips userinfo (`user:pass@`) and common secret query params
- * (`api_key`, `token`, …). Returns the input unchanged when it parses to no
- * secret, so the common `http://localhost:1234` case is displayed verbatim.
- */
-function redactUrl(raw: string): string {
-  try {
-    const u = new URL(raw);
-    let hadSecret = false;
-    if (u.username || u.password) {
-      u.username = '';
-      u.password = '';
-      hadSecret = true;
-    }
-    for (const key of ['api_key', 'apikey', 'key', 'token', 'password', 'access_token']) {
-      if (u.searchParams.has(key)) {
-        u.searchParams.set(key, '***');
-        hadSecret = true;
-      }
-    }
-    return hadSecret ? u.toString() : raw;
-  } catch {
-    return raw;
-  }
 }
 
 // ── Session-level token accounting ───────────────────────────────────
@@ -193,40 +186,6 @@ async function hydrateLifetimeFromDb(): Promise<void> {
 }
 
 /**
- * Compose the system prompt sent to the local model. Guarantees a non-empty,
- * directionally-productive instruction on EVERY call — the previous per-handler
- * merge sent no system message at all when the caller passed none and the model
- * family had no outputConstraint (Llama/Nemotron/Granite/gpt-oss/unknown).
- * Layers, in order:
- *   base       — persona (+ task, for code tasks); always present
- *   grounding  — universal anti-hallucination line (the trust lever for the QA loop)
- *   format     — JSON-only when a json_schema is set (which SUPPRESSES the
- *                markdown guidance that would otherwise contradict it);
- *                otherwise the task-appropriate format line plus any per-family
- *                constraint.
- * Compact by design — every token here is prefill the estimator and latency pay for.
- */
-function buildSystemPrompt(opts: {
-  base: string;
-  formatLine?: string;
-  modelConstraint?: string;
-  structuredOutput?: boolean;
-}): string {
-  const layers: string[] = [opts.base.trim()];
-  layers.push(
-    'Base your answer only on the information provided in this conversation. ' +
-    'If it is insufficient to answer correctly, say what is missing rather than guessing.',
-  );
-  if (opts.structuredOutput) {
-    layers.push('Return only valid JSON conforming to the requested schema — no prose, no markdown, no code fences.');
-  } else {
-    if (opts.formatLine && opts.formatLine.trim()) layers.push(opts.formatLine.trim());
-    if (opts.modelConstraint && opts.modelConstraint.trim()) layers.push(opts.modelConstraint.trim());
-  }
-  return layers.join('\n\n');
-}
-
-/**
  * Generation throughput in tokens/sec, isolating decode time from prefill.
  * `generationMs` spans connect + prefill + decode; dividing by the whole span
  * makes a large-prompt call look many times slower than the model actually
@@ -257,7 +216,7 @@ function recordUsage(resp: StreamingResult) {
     session.completionTokens += completionTokens;
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses)
-    const est = Math.ceil(resp.content.length / 4);
+    const est = Math.ceil(resp.content.length / CHARS_PER_TOKEN);
     completionTokens = est;
     session.completionTokens += est;
   }
@@ -439,16 +398,6 @@ interface StreamingResult {
   streamError?: string;
 }
 
-/** OpenAI-compatible response_format for structured output */
-interface ResponseFormat {
-  type: 'json_schema' | 'json_object' | 'text';
-  json_schema?: {
-    name: string;
-    strict?: boolean | string;
-    schema: Record<string, unknown>;
-  };
-}
-
 interface ModelInfo {
   id: string;
   object?: string;
@@ -464,6 +413,9 @@ interface ModelInfo {
   context_length?: number;     // v1 API fallback
   max_model_len?: number;      // vLLM fallback
   owned_by?: string;
+  max_output_tokens?: number;  // declared output cap (LiteLLM /model/info) — budget is clamped to it
+  upstream_model?: string;     // behind a router: the real model an alias resolves to, provider stripped
+  router_mode?: string | null; // LiteLLM mode ('chat', 'responses', ...); null = unknown, typically self-hosted
   [key: string]: unknown;
 }
 
@@ -553,9 +505,9 @@ const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
     },
   },
   {
-    pattern: /kimi[- ]?k2/i,
+    pattern: /kimi[- ]?k\d/i,
     profile: {
-      family: 'Kimi K2',
+      family: 'Kimi K-series',
       description: 'Moonshot AI\'s large MoE model with strong agentic and tool-use capabilities.',
       strengths: ['agentic tasks', 'tool use', 'code', 'reasoning', 'long context'],
       weaknesses: ['may be slower due to model size'],
@@ -580,6 +532,36 @@ const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
       strengths: ['fast inference', 'general reasoning', 'tool use', 'multilingual', 'code', 'instruction following', 'chain-of-thought'],
       weaknesses: ['always emits internal reasoning (stripped automatically)', 'less tested in English-only benchmarks than LLaMA/Qwen'],
       bestFor: ['general delegation', 'fast drafting', 'code tasks', 'structured output', 'Q&A'],
+    },
+  },
+  {
+    pattern: /deepseek/i,
+    profile: {
+      family: 'DeepSeek',
+      description: 'DeepSeek\'s MoE model family (V3/V4 and the R1 reasoning line). Strong at code and reasoning; the large variants are usually served from DeepSeek\'s API or a router rather than local hardware.',
+      strengths: ['code generation', 'code review', 'reasoning', 'long context'],
+      weaknesses: ['R1-style variants spend budget on hidden reasoning', 'large variants too big for most local GPUs'],
+      bestFor: ['code tasks', 'multi-step reasoning', 'long document analysis'],
+    },
+  },
+  {
+    pattern: /gemma[- ]?\d/i,
+    profile: {
+      family: 'Google Gemma',
+      description: 'Google\'s open-weight model family. Gemma 4 is a thinking model whose chat template enables reasoning by default, so its output budget is inflated automatically.',
+      strengths: ['general reasoning', 'instruction following', 'multilingual'],
+      weaknesses: ['Gemma 4 reasons by default (budget inflated to compensate)'],
+      bestFor: ['general delegation', 'summarisation', 'Q&A'],
+    },
+  },
+  {
+    pattern: /\bgpt-[56](?:[.-]|$)/i,
+    profile: {
+      family: 'OpenAI GPT (hosted)',
+      description: 'OpenAI\'s hosted GPT-5/GPT-6 family, reached through an API or a router. Frontier-class and fast, but every token is billed - delegation here trades Claude quota for OpenAI spend rather than for local compute.',
+      strengths: ['general reasoning', 'code', 'instruction following', 'long context'],
+      weaknesses: ['billed per token', 'reasoning variants spend budget on hidden reasoning'],
+      bestFor: ['general delegation', 'code tasks', 'offloading when the local GPU is busy'],
     },
   },
   {
@@ -609,13 +591,13 @@ const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
  * Priority: 1) static MODEL_PROFILES (curated), 2) SQLite cache (auto-generated from HF)
  */
 function getModelProfile(model: ModelInfo): ModelProfile | undefined {
-  // Try static profiles first (curated, most reliable)
-  for (const { pattern, profile } of MODEL_PROFILES) {
-    if (pattern.test(model.id)) return profile;
-  }
-  if (model.arch) {
+  // Try static profiles first (curated, most reliable). Behind a router the id
+  // is an alias ("local", "astra"), so the upstream model it resolves to is
+  // matched too - that's the name that actually identifies the family.
+  for (const key of [model.id, model.upstream_model, model.arch]) {
+    if (!key) continue;
     for (const { pattern, profile } of MODEL_PROFILES) {
-      if (pattern.test(model.arch)) return profile;
+      if (pattern.test(key)) return profile;
     }
   }
   return undefined;
@@ -655,8 +637,11 @@ async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false
   const profile = await getModelProfileAsync(model);
   const parts: string[] = [];
 
-  // Header line
-  parts.push(`  ${model.state === 'loaded' ? '●' : '○'} ${model.id}`);
+  // Header line. Backends that don't report load state (vLLM, llama.cpp, a
+  // router) list only what they serve, so no state means ready - matching the
+  // loaded/available split the callers use.
+  const ready = model.state === 'loaded' || !model.state;
+  parts.push(`  ${ready ? '●' : '○'} ${model.id}${model.upstream_model ? ` → ${model.upstream_model}` : ''}`);
 
   // Metadata line
   const meta: string[] = [];
@@ -667,9 +652,12 @@ async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false
   // Show loaded context vs max context when both are available and different
   if (model.loaded_context_length && maxCtx && model.loaded_context_length !== maxCtx) {
     meta.push(`context: ${model.loaded_context_length.toLocaleString()} (max ${maxCtx.toLocaleString()})`);
-  } else if (ctx) {
+  } else if (hasReportedContext(model)) {
     meta.push(`context: ${ctx.toLocaleString()}`);
+  } else {
+    meta.push(`context: not reported (assuming ${ctx.toLocaleString()})`);
   }
+  if (model.max_output_tokens) meta.push(`max output: ${model.max_output_tokens.toLocaleString()}`);
   if (model.publisher) meta.push(`by: ${model.publisher}`);
   if (meta.length > 0) parts.push(`    ${meta.join(' · ')}`);
 
@@ -697,6 +685,17 @@ async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false
   return parts.join('\n');
 }
 
+/** One-line summary of a model, for big catalogues where full detail would flood the context. */
+function formatModelLine(model: ModelInfo): string {
+  const ready = model.state === 'loaded' || !model.state;
+  const bits: string[] = [];
+  if (model.upstream_model) bits.push(`→ ${model.upstream_model}`);
+  if (model.type === 'embeddings') bits.push('embeddings');
+  if (hasReportedContext(model)) bits.push(`ctx ${getContextLength(model).toLocaleString()}`);
+  if (model.max_output_tokens) bits.push(`out ${model.max_output_tokens.toLocaleString()}`);
+  return `  ${ready ? '●' : '○'} ${model.id}${bits.length ? ` · ${bits.join(' · ')}` : ''}`;
+}
+
 /**
  * Fetch with a connect timeout so Claude doesn't hang when the host is offline.
  */
@@ -712,21 +711,6 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timer);
   }
-}
-
-/**
- * Parse Retry-After (seconds or HTTP-date) into ms. Null for unparseable.
- */
-function parseRetryAfter(headerValue: string | null): number | null {
-  if (!headerValue) return null;
-  const asInt = parseInt(headerValue, 10);
-  if (Number.isFinite(asInt) && asInt >= 0) return asInt * 1000;
-  const asDate = Date.parse(headerValue);
-  if (Number.isFinite(asDate)) {
-    const delta = asDate - Date.now();
-    return delta > 0 ? delta : 0;
-  }
-  return null;
 }
 
 /**
@@ -791,25 +775,6 @@ async function timedRead(
   }
 }
 
-/**
- * Streaming chat completion with soft timeout.
- *
- * Uses SSE streaming (`stream: true`) so tokens arrive incrementally.
- * If we approach the MCP SDK's ~60s timeout (soft limit at 55s), we
- * return whatever content we have so far with `truncated: true`.
- * This means large code reviews return partial results instead of nothing.
- */
-/** Optional per-request sampling controls, passed through to the backend when set. */
-interface SamplingParams {
-  seed?: number;
-  stop?: string | string[];
-  topP?: number;
-  topK?: number;
-  repeatPenalty?: number;
-  frequencyPenalty?: number;
-  presencePenalty?: number;
-}
-
 interface InferenceOptions {
   temperature?: number;
   maxTokens?: number;
@@ -817,40 +782,6 @@ interface InferenceOptions {
   responseFormat?: ResponseFormat;
   progressToken?: string | number;
   sampling?: SamplingParams;
-}
-
-/**
- * Extract and RANGE-VALIDATE optional sampling params from tool args. Out-of-range,
- * NaN, or wrong-type values are dropped (undefined) rather than forwarded — the
- * backend then applies its own default. This also closes the earlier gap where an
- * unvalidated max_tokens/temperature could reach the upstream request.
- */
-function extractSamplingParams(args: Record<string, unknown>): SamplingParams {
-  const range = (v: unknown, min: number, max: number): number | undefined => {
-    const n = typeof v === 'number' ? v : NaN;
-    return Number.isFinite(n) && n >= min && n <= max ? n : undefined;
-  };
-  const stopRaw = args.stop;
-  const stop = typeof stopRaw === 'string'
-    ? stopRaw
-    : Array.isArray(stopRaw)
-      ? (stopRaw.filter((s) => typeof s === 'string').slice(0, 4) as string[])
-      : undefined;
-  return {
-    seed: Number.isInteger(args.seed) ? (args.seed as number) : undefined,
-    stop: stop && stop.length ? stop : undefined,
-    topP: range(args.top_p, 0, 1),
-    topK: range(args.top_k, 1, 100_000),
-    repeatPenalty: range(args.repeat_penalty, 0, 2),
-    frequencyPenalty: range(args.frequency_penalty, -2, 2),
-    presencePenalty: range(args.presence_penalty, -2, 2),
-  };
-}
-
-/** Clamp a caller-supplied temperature to a sane range, or undefined if unusable. */
-function validTemperature(v: unknown): number | undefined {
-  const n = typeof v === 'number' ? v : NaN;
-  return Number.isFinite(n) && n >= 0 && n <= 2 ? n : undefined;
 }
 
 /**
@@ -865,35 +796,23 @@ const MIN_MAX_TOKENS = (() => {
   return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4096;
 })();
 
-/** Clamp a caller-supplied max_tokens to a positive sane range, or undefined. */
+/** Validate a caller-supplied max_tokens against the floor, logging when it's overridden. */
 function validMaxTokens(v: unknown): number | undefined {
-  const n = typeof v === 'number' ? v : NaN;
-  if (!Number.isInteger(n) || n <= 0 || n > 1_000_000) return undefined;
-  if (n < MIN_MAX_TOKENS) {
+  return validMaxTokensWithFloor(v, MIN_MAX_TOKENS, (n) => {
     process.stderr.write(
       `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor — ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
     );
-    return undefined;
-  }
-  return n;
+  });
 }
 
 /**
- * Build an OpenAI response_format from the tool's json_schema input. Accepts
- * BOTH the documented wrapper `{ name, schema, strict }` and a bare JSON Schema
- * (which the description invites) — the latter previously produced undefined
- * name/schema and silently unconstrained output.
+ * Streaming chat completion with soft timeout.
+ *
+ * Uses SSE streaming (`stream: true`) so tokens arrive incrementally.
+ * Progress notifications keep the MCP client's request timeout alive; the
+ * soft timeout returns whatever content we have with `truncated: true`, so
+ * large code reviews return partial results instead of nothing.
  */
-function toResponseFormat(js: unknown): ResponseFormat | undefined {
-  if (!js || typeof js !== 'object') return undefined;
-  const obj = js as Record<string, unknown>;
-  const hasWrapper = !!obj.schema && typeof obj.schema === 'object';
-  const schema = (hasWrapper ? obj.schema : obj) as Record<string, unknown>;
-  const name = hasWrapper && typeof obj.name === 'string' ? obj.name : 'response';
-  const strict = hasWrapper && typeof obj.strict === 'boolean' ? obj.strict : true;
-  return { type: 'json_schema', json_schema: { name, strict, schema } };
-}
-
 async function chatCompletionStreaming(
   messages: ChatMessage[],
   options: InferenceOptions = {},
@@ -901,26 +820,63 @@ async function chatCompletionStreaming(
   return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
 }
 
+// ── Model list cache ─────────────────────────────────────────────────
+// Every inference call needs the target model's context window and output
+// cap, and routing needs the list too. Re-fetching per call costs one HTTP
+// round trip to a local server - or two (~700ms) behind a LiteLLM router with
+// hundreds of entries. A short TTL keeps it fresh without paying that per
+// call. discover / list_models bypass the cache so they always show live state.
+
+const MODEL_LIST_TTL_MS = 30_000;
+let modelListCache: { at: number; models: ModelInfo[] } | null = null;
+let modelListInFlight: Promise<ModelInfo[]> | null = null;
+
 /**
- * Pull a human-readable message out of an OpenAI-style mid-stream error
- * payload (`data: {"error":{...}}`). Returns undefined when the chunk carries
- * no error, so callers can treat a truthy result as "the backend failed".
+ * Publish a model list only if it's at least as fresh as what's cached. `at`
+ * is when the fetch STARTED: a slow fetch that began before a newer one must
+ * not overwrite it on arrival (e.g. startup profiling finishing after a live
+ * list_models showed a model had been unloaded).
  */
-function extractStreamError(json: unknown): string | undefined {
-  if (!json || typeof json !== 'object') return undefined;
-  const err = (json as { error?: unknown }).error;
-  if (!err) return undefined;
-  if (typeof err === 'string') return err;
-  if (typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
-    return (err as { message: string }).message;
+function publishModelList(startedAt: number, models: ModelInfo[]): void {
+  if (!modelListCache || startedAt >= modelListCache.at) {
+    modelListCache = { at: startedAt, models };
   }
-  return JSON.stringify(err);
 }
 
-/** Get the first loaded model's info for context-aware defaults. */
-async function getActiveModel(): Promise<ModelInfo | null> {
+/** Fetch the live list and publish it. Used by discover / list_models / startup. */
+async function fetchAndPublishModelList(): Promise<ModelInfo[]> {
+  const startedAt = Date.now();
+  const models = await listModelsRaw();
+  publishModelList(startedAt, models);
+  return models;
+}
+
+async function listModelsCached(): Promise<ModelInfo[]> {
+  if (modelListCache && Date.now() - modelListCache.at < MODEL_LIST_TTL_MS) {
+    return modelListCache.models;
+  }
+  // Coalesce concurrent misses - with serialisation off, a burst of parallel
+  // calls would otherwise each hit the router for the same list.
+  if (!modelListInFlight) {
+    modelListInFlight = fetchAndPublishModelList().finally(() => { modelListInFlight = null; });
+  }
+  return modelListInFlight;
+}
+
+/**
+ * The ModelInfo for the model a call will actually be sent to. The previous
+ * version always used the FIRST loaded model, so on a multi-model backend (a
+ * router, OpenRouter, LM Studio with two models loaded) a call pinned to one
+ * model was budget-sized from another's context window. With no id, returns the
+ * first loaded model (the single-model LM Studio / Ollama case). With an id the
+ * backend doesn't advertise, returns null - borrowing another model's limits is
+ * the bug being fixed; unknown limits fall back to the default budget and the
+ * context-overflow self-heal.
+ */
+async function getModelEntry(modelId: string | undefined): Promise<ModelInfo | null> {
   try {
-    const models = await listModelsRaw();
+    const models = await listModelsCached();
+    if (modelId) return models.find((m) => m.id === modelId) ?? null;
     return models.find((m: ModelInfo) => m.state === 'loaded') ?? models[0] ?? null;
   } catch { return null; }
 }
@@ -934,44 +890,24 @@ async function chatCompletionStreamingInner(
   // Ollama returns HTTP 400 ("model is required") if the field is absent;
   // LM Studio accepts an empty field and picks the loaded default. Resolving
   // eagerly makes the two backends behave identically from the caller's POV.
-  let resolvedModel: string | undefined = options.model || LM_MODEL || undefined;
-  let activeModelCached: ModelInfo | null = null;
-  const resolveActive = async () => {
-    if (activeModelCached === null) activeModelCached = await getActiveModel();
-    return activeModelCached;
-  };
-  if (!resolvedModel) {
-    const active = await resolveActive();
-    if (active) resolvedModel = active.id;
-  }
+  // Size the budget from the model the call is ACTUALLY sent to - not whichever
+  // model the backend happens to list first (see getModelEntry).
+  const modelEntry = await getModelEntry(options.model || LM_MODEL || undefined);
+  const resolvedModel: string | undefined = options.model || LM_MODEL || modelEntry?.id || undefined;
+  const contextLen: number | undefined = modelEntry ? getContextLength(modelEntry) : undefined;
+  const maxOutput: number | undefined = modelEntry?.max_output_tokens;
 
-  // Derive max_tokens from the model's actual context window when not explicitly set.
-  // Uses 25% of context as a generous output budget (e.g. 262K context → 65K output).
-  let contextLen: number | undefined;
-  {
-    const activeModel = await resolveActive();
-    if (activeModel) contextLen = getContextLength(activeModel);
-  }
-  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-  if (!options.maxTokens && contextLen) {
-    effectiveMaxTokens = Math.floor(contextLen * 0.25);
-  }
-
-  // Never request more output than the context window can hold alongside the
-  // prompt — vLLM (and strict OpenAI backends) reject prompt+max_tokens >
-  // context with a 400 instead of clamping. Conservative prompt estimate:
-  // 1 token ≈ 3 chars, plus per-message overhead.
+  // Generous default (a quarter of the real context window), then clamped to
+  // what the backend will accept: the model's declared max output (a hosted
+  // model 400s past it) and the room left beside the prompt (vLLM and strict
+  // OpenAI backends 400 on prompt + max_tokens > context instead of clamping).
   const promptChars = messages.reduce(
     (n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length),
     0,
   );
-  const capToContext = (requested: number): number => {
-    if (!contextLen) return requested;
-    const cap = contextLen - (Math.ceil(promptChars / 3) + 64 * messages.length + 512);
-    // If the prompt alone (over)fills the context, don't mangle the request —
-    // let the backend report the real overflow.
-    return cap > 0 ? Math.min(requested, cap) : requested;
-  };
+  const capToContext = (requested: number): number =>
+    capOutputBudget(requested, { contextLen, maxOutput, promptChars, messageCount: messages.length });
+  let effectiveMaxTokens = options.maxTokens ?? autoOutputBudget(contextLen, DEFAULT_MAX_TOKENS);
   effectiveMaxTokens = capToContext(effectiveMaxTokens);
 
   const body: Record<string, unknown> = {
@@ -1034,12 +970,21 @@ async function chatCompletionStreamingInner(
     // guarantee the model generates less of it.
     body.reasoning = { exclude: true };
     const beforeInflation = effectiveMaxTokens;
-    const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
+    const inflated = capToContext(inflateForThinking(beforeInflation));
     body.max_tokens = inflated;
     body.max_completion_tokens = inflated;
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
   } else if (modelId) {
-    const thinking = await getThinkingSupport(modelId);
+    // Behind a router the id is an alias ("local") that means nothing to the
+    // detector. Check the upstream model it resolves to as well - that's what
+    // lets a real thinking model behind an alias get the no-think toggle
+    // automatically, without HOUTINI_LM_THINKING=off.
+    const upstream = modelEntry?.upstream_model;
+    const [byId, byUpstream] = await Promise.all([
+      getThinkingSupport(modelId),
+      upstream ? getThinkingSupport(upstream) : Promise.resolve(null),
+    ]);
+    const thinking = byId?.supportsThinkingToggle ? byId : byUpstream?.supportsThinkingToggle ? byUpstream : byId;
     // HF-metadata detection can't see vLLM's arbitrary served-names (e.g. an
     // endpoint that serves "coder-next" instead of the real Qwen3-Coder-Next id),
     // so a genuine thinking model looks non-thinking and the no-think toggle
@@ -1064,10 +1009,10 @@ async function chatCompletionStreamingInner(
       // Inflation uses effectiveMaxTokens (the context-aware value), not
       // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
       const beforeInflation = effectiveMaxTokens;
-      const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
+      const inflated = capToContext(inflateForThinking(beforeInflation));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
-      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}${upstream ? ` (→ ${upstream})` : ''}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 
@@ -1410,8 +1355,12 @@ async function chatCompletionStreamingInner(
   // safer failure than deleting answer text (silent, unrecoverable). The earlier
   // backtick heuristic was lose-lose (leaked reasoning containing code, still
   // deleted answers with an unquoted literal); the profile flag is the right signal.
-  const thinkProfile = await getThinkingSupport(modelId).catch(() => null);
-  if (thinkProfile?.emitsThinkBlocks && cleanContent.includes('</think>')) {
+  const [thinkById, thinkByUpstream] = await Promise.all([
+    getThinkingSupport(modelId).catch(() => null),
+    modelEntry?.upstream_model ? getThinkingSupport(modelEntry.upstream_model).catch(() => null) : Promise.resolve(null),
+  ]);
+  const emitsThinkBlocks = !!(thinkById?.emitsThinkBlocks || thinkByUpstream?.emitsThinkBlocks);
+  if (emitsThinkBlocks && cleanContent.includes('</think>')) {
     cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
   }
   cleanContent = cleanContent.trim();
@@ -1462,7 +1411,7 @@ async function chatCompletionStreamingInner(
 // regardless of backend — this flag is for enrichment (richer model metadata,
 // accurate "it's LM Studio, so the dev-toggle for reasoning_content matters"
 // hints in diagnostics, etc.).
-type Backend = 'lmstudio' | 'ollama' | 'openai-compat' | 'openrouter';
+type Backend = 'lmstudio' | 'ollama' | 'openai-compat' | 'openrouter' | 'litellm';
 let detectedBackend: Backend | null = null;
 
 function getBackend(): Backend {
@@ -1511,13 +1460,41 @@ function getProviderProfile(): ProviderProfile {
     };
   }
 
-  // Local / OpenAI-compatible defaults.
+  // A LiteLLM router usually fronts rate-limited cloud tiers (DeepSeek, OpenAI)
+  // alongside local models. Without backoff a batch of calls to a cloud tier
+  // hits HTTP 429 and silently loses its work - a 1,467-item batch once graded
+  // only 390 before stalling. Serialisation stays on by default (the router may
+  // front a single-GPU model); HOUTINI_LM_SERIALISE=0 still turns it off.
+  if (backend === 'litellm' || HOUTINI_LM_PROVIDER === 'litellm') {
+    return {
+      extraHeaders: {},
+      serialiseInference: true,
+      retryOnRateLimit: true,
+      reasoningStyle: 'think-blocks',
+    };
+  }
+
+  // Local / OpenAI-compatible defaults. HOUTINI_LM_RETRY_RATELIMIT=1 opts in
+  // to 429/5xx backoff for any other proxy that fronts a rate-limited API.
   return {
     extraHeaders: {},
     serialiseInference: true,
-    retryOnRateLimit: false,
+    retryOnRateLimit: RETRY_RATELIMIT_OPT_IN,
     reasoningStyle: 'think-blocks',
   };
+}
+
+const RETRY_RATELIMIT_OPT_IN = /^(1|true|yes|on)$/i.test(process.env.HOUTINI_LM_RETRY_RATELIMIT || '');
+
+/** Human label for the detected backend, used by discover and stats. */
+function backendLabel(): string {
+  switch (getBackend()) {
+    case 'lmstudio': return 'LM Studio';
+    case 'ollama': return 'Ollama';
+    case 'openrouter': return 'OpenRouter';
+    case 'litellm': return 'LiteLLM router';
+    default: return 'OpenAI-compatible';
+  }
 }
 
 /**
@@ -1606,15 +1583,84 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
     // Not Ollama — fall through
   }
 
-  // Fallback: OpenAI-compatible v1 endpoint (DeepSeek, vLLM, llama.cpp, OpenRouter)
+  // Fallback: OpenAI-compatible v1 endpoint (DeepSeek, vLLM, llama.cpp, LiteLLM)
   const res = await fetchWithTimeout(
     `${LM_BASE_URL}/v1/models`,
     { headers: apiHeaders() },
   );
   if (!res.ok) throw new Error(`Failed to list models: ${res.status}`);
   const data = (await res.json()) as { data: ModelInfo[] };
+
+  // A LiteLLM router answers /model/info with what /v1/models leaves out: the
+  // real model behind each alias, its mode, and (for models LiteLLM prices)
+  // the true context and output limits. Best-effort - no key, a 401, or a
+  // non-LiteLLM endpoint just means plain OpenAI-compatible behaviour.
+  const routerInfo = await probeRouterInfo();
+  if (routerInfo) {
+    detectedBackend = 'litellm';
+    return enrichFromRouter(data.data, routerInfo);
+  }
   detectedBackend = 'openai-compat';
   return data.data;
+}
+
+/**
+ * Once an endpoint has definitively answered "not a LiteLLM router" we stop
+ * probing - plain vLLM, llama.cpp and cloud APIs would otherwise pay an extra
+ * 404 round trip on every model list. Only definitive answers count: no such
+ * route (404/405), a key that can't read it (401/403 - the key can't change
+ * mid-process), or a body that isn't LiteLLM-shaped. A 429 or 408 is transient
+ * - negative-caching one would permanently switch off router handling,
+ * including the rate-limit backoff meant for exactly that 429. Network errors
+ * don't count either; the router may just not be up yet.
+ */
+let notARouter = false;
+const DEFINITIVE_NOT_A_ROUTER = new Set([401, 403, 404, 405]);
+
+/** GET /model/info. Returns parsed router metadata, or null if this isn't a LiteLLM router. */
+async function probeRouterInfo(): Promise<RouterModelInfo[] | null> {
+  if (notARouter) return null;
+  try {
+    const res = await fetchWithTimeout(`${LM_BASE_URL}/model/info`, { headers: apiHeaders() });
+    if (!res.ok) {
+      try { await res.body?.cancel(); } catch { /* ignore */ }
+      if (DEFINITIVE_NOT_A_ROUTER.has(res.status)) notARouter = true;
+      return null;
+    }
+    const parsed = parseModelInfo(await res.json().catch(() => null));
+    if (!parsed) notARouter = true;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Merge /model/info into the /v1/models list. Keeps the alias as the callable
+ * id (it's what inference must be sent to) and adds the upstream model, the
+ * real limits and the mode. Drops wildcard routes and anything that can't
+ * answer chat or embeddings - a real router lists dozens of TTS, image, video,
+ * realtime and moderation models that are pure noise in discover and a
+ * guaranteed error if routing ever picked one.
+ */
+function enrichFromRouter(models: ModelInfo[], info: RouterModelInfo[]): ModelInfo[] {
+  const byAlias = new Map(info.map((i) => [i.alias, i]));
+  const out: ModelInfo[] = [];
+  for (const m of models) {
+    if (isWildcardAlias(m.id)) continue;
+    const r = byAlias.get(m.id);
+    const cls = classifyMode(r?.mode);
+    if (cls === 'other') continue;
+    out.push({
+      ...m,
+      type: cls === 'embedding' ? 'embeddings' : 'llm',
+      context_length: r?.maxInputTokens ?? m.context_length,
+      max_output_tokens: r?.maxOutputTokens ?? m.max_output_tokens,
+      upstream_model: r?.upstreamBare ?? undefined,
+      router_mode: r?.mode ?? null,
+    });
+  }
+  return out;
 }
 
 function getContextLength(model: ModelInfo): number {
@@ -1625,6 +1671,11 @@ function getContextLength(model: ModelInfo): number {
 
 function getMaxContextLength(model: ModelInfo): number | undefined {
   return model.max_context_length;
+}
+
+/** True when the backend actually reported a context window (vs our fallback guess). */
+function hasReportedContext(model: ModelInfo): boolean {
+  return !!(model.loaded_context_length ?? model.max_context_length ?? model.context_length ?? model.max_model_len);
 }
 
 /**
@@ -1659,10 +1710,6 @@ function getReasoningEffortValue(_modelId: string): string | null {
   return 'low';
 }
 
-/** Rough chars→tokens ratio used for pre-flight estimates. Matches the ratio
- * we already use to estimate completion_tokens when usage is missing. */
-const CHARS_PER_TOKEN = 4;
-
 /** Conservative default prefill rate when no per-model measurement exists.
  * Slower than real hardware so we err toward letting the call run — a false
  * refusal is much worse than a false-ok that eventually times out. */
@@ -1684,6 +1731,8 @@ interface PrefillEstimate {
   fit?: { alphaMs: number; betaMsPerToken: number; r2: number; n: number };
   /** Ratio rate when basis === 'ratio' (fallback). */
   prefillTokPerSec?: number;
+  /** Largest prompt among the samples behind a ratio estimate - bounds how far it may extrapolate. */
+  maxSampledPromptTokens?: number;
 }
 
 /**
@@ -1727,6 +1776,7 @@ async function estimatePrefill(inputChars: number, modelId: string): Promise<Pre
           estimatedSeconds: inputTokens / prefillTokPerSec,
           basis: 'ratio',
           prefillTokPerSec,
+          maxSampledPromptTokens: samples.reduce((m, s) => Math.max(m, s.promptTokens), 0),
         };
       }
     }
@@ -1762,21 +1812,27 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
   // the user knows the model id and doesn't want routing to second-guess.
   const pinned = override || LM_MODEL;
   if (pinned) {
-    const hints = getPromptHints(pinned);
+    // Behind a router the pinned id is an alias - take the prompt hints from
+    // the model it resolves to, when we know it.
+    let upstream: string | undefined;
+    try { upstream = (await listModelsCached()).find((m) => m.id === pinned)?.upstream_model; } catch { /* unreachable - no hint */ }
+    const hints = getPromptHints(pinned, upstream);
     return { modelId: pinned, hints };
   }
 
   let models: ModelInfo[];
   try {
-    models = await listModelsRaw();
+    models = await listModelsCached();
   } catch {
     // Can't reach server — fall back to default (empty string; caller handles)
     const hints = getPromptHints(LM_MODEL);
     return { modelId: LM_MODEL || '', hints };
   }
 
-  const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
-  const available = models.filter((m) => m.state === 'not-loaded');
+  // An embedding model can't answer a chat/code/analysis task - never route one there.
+  const eligible = models.filter((m) => taskType === 'embedding' || m.type !== 'embeddings');
+  const loaded = eligible.filter((m) => m.state === 'loaded' || !m.state);
+  const available = eligible.filter((m) => m.state === 'not-loaded');
 
   if (loaded.length === 0) {
     const hints = getPromptHints(LM_MODEL);
@@ -1788,11 +1844,13 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
   let bestScore = -1;
 
   for (const model of loaded) {
-    const hints = getPromptHints(model.id, model.arch);
+    const hints = getPromptHints(model.id, model.upstream_model ?? model.arch);
     // Primary: is this task type in the model's best types?
     let score = (hints.bestTaskTypes ?? []).includes(taskType) ? 10 : 0;
-    // Bonus: code-specialised models get extra points for code tasks
-    const profile = getModelProfile(model);
+    // Bonus: code-specialised models get extra points for code tasks. The async
+    // lookup includes profiles auto-generated from HuggingFace, not just the
+    // hardcoded list - so a coder model we've never curated still gets it.
+    const profile = await getModelProfileAsync(model);
     if (taskType === 'code' && profile?.family.toLowerCase().includes('coder')) score += 5;
     // Bonus: larger context for analysis tasks
     if (taskType === 'analysis') {
@@ -1805,7 +1863,7 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
     }
   }
 
-  const hints = getPromptHints(bestModel.id, bestModel.arch);
+  const hints = getPromptHints(bestModel.id, bestModel.upstream_model ?? bestModel.arch);
   const result: RoutingDecision = { modelId: bestModel.id, hints };
 
   // If the best loaded model isn't ideal for this task, suggest a better available one.
@@ -1813,7 +1871,7 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
   // hard timeout. Instead, suggest the user loads the better model in LM Studio.
   if (!(hints.bestTaskTypes ?? []).includes(taskType)) {
     const better = available.find((m) => {
-      const mHints = getPromptHints(m.id, m.arch);
+      const mHints = getPromptHints(m.id, m.upstream_model ?? m.arch);
       return (mHints.bestTaskTypes ?? []).includes(taskType);
     });
     if (better) {
@@ -1892,9 +1950,9 @@ function formatQualityLine(quality: QualitySignal): string {
  *   💰 Claude quota saved this session: ...
  */
 function formatFooter(resp: StreamingResult, extra?: string): string {
-  // Record usage for session tracking before formatting
-  recordUsage(resp);
-
+  // Pure formatter. Accounting is the caller's job (recordUsage, once per
+  // response, BEFORE this) - a formatter that mutated session, lifetime and
+  // SQLite state would double-count the moment anything rendered a footer twice.
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
   if (resp.usage) {
@@ -1916,7 +1974,7 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
     }
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses where final SSE chunk was lost)
-    const estTokens = Math.ceil(resp.content.length / 4);
+    const estTokens = Math.ceil(resp.content.length / CHARS_PER_TOKEN);
     parts.push(`~${estTokens} tokens (estimated)`);
   }
 
@@ -1966,7 +2024,7 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
  * answer stays in the text content block, so the payload isn't duplicated. No
  * `outputSchema` is declared: on the low-level Server that would invoke client-side
  * validation and risk an outputSchema-aware client rendering only the structured
- * object and dropping the answer. Call AFTER formatFooter so quotaSaved reflects
+ * object and dropping the answer. Call AFTER recordUsage so quotaSaved reflects
  * the call just recorded.
  */
 function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>): Record<string, unknown> {
@@ -2385,6 +2443,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        recordUsage(resp);
         const footer = formatFooter(resp);
         return {
           content: [{ type: 'text', text: resp.content + footer }],
@@ -2436,6 +2495,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        recordUsage(resp);
         const footer = formatFooter(resp);
         return {
           content: [{ type: 'text', text: resp.content + footer }],
@@ -2484,6 +2544,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
+        recordUsage(codeResp);
         const codeFooter = formatFooter(codeResp, lang);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         return {
@@ -2566,9 +2627,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // restart with different perf settings) must not refuse the call: a
         // false refusal is worse than a false-ok that the prefill keepalive
         // and timeout machinery already handle.
-        const isConfidentEstimate =
-          (estimate.basis === 'linear-fit' && estimate.fit!.r2 >= 0.5) ||
-          estimate.basis === 'ratio';
+        // A ratio estimate is only trusted while it's interpolating - see
+        // isConfidentPrefillEstimate for the cloud-model case that motivated it.
+        const isConfidentEstimate = isConfidentPrefillEstimate(estimate);
         if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'
@@ -2625,6 +2686,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const readSummary = successCount === paths.length
           ? `${paths.length} file(s) read`
           : `${successCount}/${paths.length} file(s) read`;
+        recordUsage(codeResp);
         const codeFooter = formatFooter(codeResp, `${lang} · ${readSummary}`);
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         return {
@@ -2641,7 +2703,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const start = Date.now();
         let models: ModelInfo[];
         try {
-          models = await listModelsRaw();
+          // Always live - and refresh the cache inference reads from while we're here.
+          models = await fetchAndPublishModelList();
         } catch (err) {
           const ms = Date.now() - start;
           const reason = err instanceof Error && err.name === 'AbortError'
@@ -2684,7 +2747,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const primary = loaded[0] || models[0];
+        // The active model is the one unpinned calls will actually land on: the
+        // HOUTINI_LM_MODEL pin when set (and served), otherwise the first listed.
+        const pinnedEntry = LM_MODEL ? models.find((m) => m.id === LM_MODEL) : undefined;
+        const primary = pinnedEntry || loaded[0] || models[0];
         const ctx = getContextLength(primary);
         const primaryProfile = await getModelProfileAsync(primary);
 
@@ -2722,17 +2788,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           speedLine = `Measured speed: not yet benchmarked — will be captured on the first real call.\n`;
         }
 
-        const backendLabel = getBackend() === 'lmstudio' ? 'LM Studio'
-          : getBackend() === 'ollama' ? 'Ollama'
-          : 'OpenAI-compatible';
+        const ctxLine = hasReportedContext(primary)
+          ? `${ctx.toLocaleString()} tokens`
+          : `not reported by the backend (assuming ${ctx.toLocaleString()} - set HOUTINI_LM_CONTEXT_WINDOW to correct it)`;
 
         let text =
           `Status: ONLINE\n` +
-          `Endpoint: ${redactUrl(LM_BASE_URL)} (${backendLabel})\n` +
+          `Endpoint: ${redactUrl(LM_BASE_URL)} (${backendLabel()})\n` +
           `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
-          `Active model: ${primary.id}\n` +
-          `Context window: ${ctx.toLocaleString()} tokens\n` +
+          `Active model: ${primary.id}${primary.upstream_model ? ` → ${primary.upstream_model}` : ''}${pinnedEntry ? ' (pinned via HOUTINI_LM_MODEL)' : ''}\n` +
+          `Context window: ${ctxLine}\n` +
+          (primary.max_output_tokens ? `Max output: ${primary.max_output_tokens.toLocaleString()} tokens\n` : '') +
           speedLine;
+
+        // With several chat models and no pin, routing scores them by task and,
+        // on a tie (the norm for router aliases and big catalogues), takes the
+        // first listed. Say so - that's how work silently lands on a model the
+        // user meant to spare (e.g. a local GPU behind a router's first alias).
+        const chatModels = loaded.filter((m) => m.type !== 'embeddings');
+        if (!LM_MODEL && chatModels.length > 1) {
+          text += `Routing: no HOUTINI_LM_MODEL pin - unpinned calls route by task and, on a tie, land on the first listed model (${chatModels[0].id}). Pin one, or pass \`model\` per call, to control where work goes.\n`;
+        } else if (LM_MODEL && !pinnedEntry) {
+          text += `Routing: HOUTINI_LM_MODEL=${LM_MODEL} is set but this endpoint doesn't list it - calls will still be sent to that id.\n`;
+        }
 
         if (primaryProfile) {
           text += `Family: ${primaryProfile.family}\n`;
@@ -2744,14 +2822,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        // Cap the catalogue. A router or OpenRouter can list hundreds of models,
+        // and discover is meant to be cheap - list_models has the full set.
         if (loaded.length > 0) {
+          const shown = loaded.slice(0, DISCOVER_MODEL_LIMIT);
           text += `\nLoaded models (● ready to use):\n`;
-          text += (await Promise.all(loaded.map((m) => formatModelDetail(m)))).join('\n\n');
+          text += (await Promise.all(shown.map((m) => formatModelDetail(m)))).join('\n\n');
+          if (loaded.length > shown.length) {
+            text += `\n\n  …and ${loaded.length - shown.length} more. Run list_models for the full catalogue.`;
+          }
         }
 
         if (available.length > 0) {
+          const shown = available.slice(0, DISCOVER_MODEL_LIMIT);
           text += `\n\nAvailable models (○ downloaded, not loaded — can be activated in LM Studio):\n`;
-          text += (await Promise.all(available.map((m) => formatModelDetail(m)))).join('\n\n');
+          text += (await Promise.all(shown.map((m) => formatModelDetail(m)))).join('\n\n');
+          if (available.length > shown.length) {
+            text += `\n\n  …and ${available.length - shown.length} more. Run list_models for the full catalogue.`;
+          }
         }
 
         // Per-model performance stats from this session
@@ -2786,7 +2874,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'list_models': {
-        const models = await listModelsRaw();
+        const models = await fetchAndPublishModelList();
         if (!models.length) {
           return { content: [{ type: 'text', text: 'No models currently loaded or available.' }] };
         }
@@ -2794,18 +2882,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
         const available = models.filter((m) => m.state === 'not-loaded');
 
-        let text = '';
+        // Full detail for a handful of models; one line each for a big
+        // catalogue (routers, OpenRouter) so the listing doesn't flood the
+        // client's context - the thing this whole server exists to protect.
+        const compact = models.length > LIST_MODELS_DETAIL_LIMIT;
+        const render = async (ms: ModelInfo[]) => compact
+          ? ms.map(formatModelLine).join('\n')
+          : (await Promise.all(ms.map((m) => formatModelDetail(m, true)))).join('\n\n');
+
+        let text = compact ? `${models.length} models (compact view - pin one with HOUTINI_LM_MODEL or pass \`model\` per call).\n\n` : '';
 
         // list_models enriches with HuggingFace data (cached after first call)
         if (loaded.length > 0) {
           text += `Loaded models (● ready to use):\n\n`;
-          text += (await Promise.all(loaded.map((m) => formatModelDetail(m, true)))).join('\n\n');
+          text += await render(loaded);
         }
 
         if (available.length > 0) {
           if (text) text += '\n\n';
           text += `Available models (○ downloaded, not loaded):\n\n`;
-          text += (await Promise.all(available.map((m) => formatModelDetail(m, true)))).join('\n\n');
+          text += await render(available);
         }
 
         return { content: [{ type: 'text', text }] };
@@ -2867,14 +2963,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'stats': {
         const { model: filterModel } = args as { model?: string };
 
-        const backendLabel = getBackend() === 'lmstudio' ? 'LM Studio'
-          : getBackend() === 'ollama' ? 'Ollama'
-          : 'OpenAI-compatible';
-
         const lines: string[] = [];
         lines.push(`## Houtini LM stats`);
         lines.push('');
-        lines.push(`**Endpoint**: ${redactUrl(LM_BASE_URL)} (${backendLabel})`);
+        lines.push(`**Endpoint**: ${redactUrl(LM_BASE_URL)} (${backendLabel()})`);
         if (lifetime.firstSeenAt) {
           lines.push(`**First call on this workstation**: ${new Date(lifetime.firstSeenAt).toISOString().slice(0, 10)}`);
         }
@@ -2971,8 +3063,23 @@ async function main() {
 
   // Background: profile all available models via HF → SQLite cache
   // Non-blocking — server is already accepting requests
-  listModelsRaw()
-    .then((models) => profileModelsAtStartup(models))
+  fetchAndPublishModelList()
+    .then((models) => {
+      // Behind a router only self-hosted models need profiling - LiteLLM has
+      // no metadata for them. Hosted ones are already described by /model/info,
+      // and profiling each would cost a pointless HuggingFace round trip
+      // (a real router lists 100+).
+      const toProfile = getBackend() === 'litellm'
+        ? models.filter((m) => m.router_mode === null && m.type !== 'embeddings')
+        : models;
+      return profileModelsAtStartup(toProfile.map((m) => ({
+        id: m.id,
+        publisher: m.publisher,
+        arch: m.arch,
+        type: m.type,
+        upstream: m.upstream_model,
+      })));
+    })
     .catch((err) => process.stderr.write(`[houtini-lm] Startup profiling skipped: ${err}\n`));
 
   // Hydrate the in-memory lifetime mirror from SQLite so the very first

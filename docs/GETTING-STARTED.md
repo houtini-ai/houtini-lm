@@ -98,6 +98,25 @@ Endpoint: `http://localhost:8000`. vLLM shines when several agents hit it
 concurrently - relevant if you're running houtini under a multi-agent
 orchestrator.
 
+### SGLang (repeated context, agent loops)
+
+```bash
+docker run -d --gpus all --shm-size 32g --ipc=host -p 30000:30000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  lmsysorg/sglang:latest \
+  python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-Coder-32B-Instruct \
+  --host 0.0.0.0 --port 30000
+```
+
+Endpoint: `http://localhost:30000`. SGLang's RadixAttention keeps the KV cache
+for prompt prefixes it has already seen, so when Claude sends the same material
+more than once - the file under review, a spec, a style guide - across a run of
+delegated calls, only the new part of each prompt has to be processed. Keep the
+shared material at the *start* of the prompt so the prefix actually matches.
+The footer tells you when it's working (`… prompt tokens cached`). It batches
+natively, so set `HOUTINI_LM_SERIALISE=0`; for a thinking model add its
+`--reasoning-parser` so reasoning comes back separately from the answer.
+
 ---
 
 ## Pointing houtini at your endpoint

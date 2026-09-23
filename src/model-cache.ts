@@ -713,6 +713,8 @@ interface ModelInfoForCache {
   publisher?: string;
   arch?: string;
   type?: string;
+  /** Behind a router: the real model the alias `id` resolves to (provider stripped). */
+  upstream?: string;
 }
 
 /**
@@ -733,13 +735,20 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
     try {
       // Check cache
       const cached = await getCachedProfile(model.id);
-      if (cached && !isCacheStale(cached)) {
+      // An alias profiled before router resolution existed carries no upstream
+      // hint - re-profile it now rather than serve the blind version for a week.
+      const missingUpstream = !!model.upstream && !cached?.architectures;
+      if (cached && !isCacheStale(cached) && !missingUpstream) {
         cachedCount++;
         continue;
       }
 
-      // Look up on HuggingFace
-      const card = await lookupHF(model.id, model.publisher);
+      // Look up on HuggingFace. Behind a router the id is an alias ("local")
+      // and the upstream is what HF might know - but only an org/name upstream
+      // is a repo id; a bare name ("qwen3.6-27b") would just 404.
+      const card = model.upstream
+        ? (model.upstream.includes('/') ? await lookupHF(model.upstream) : null)
+        : await lookupHF(model.id, model.publisher);
 
       if (card) {
         const inferred = inferProfileFromHF(card, model.id);
@@ -766,21 +775,29 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
       } else {
         // No HF match — cache a minimal profile so we don't retry.
         // Use architecture-based thinking detection as fallback for gated models.
-        const thinking = detectThinkingSupportFromArch(model.arch || '', model.id);
+        // Behind a router, detect from the upstream name: "local" says nothing,
+        // "qwen3.6-27b" identifies a Qwen3 thinking model.
+        const nameForDetection = model.upstream || model.id;
+        const thinking = detectThinkingSupportFromArch(model.arch || '', nameForDetection);
         if (thinking.supportsThinkingToggle) {
-          process.stderr.write(`[houtini-lm] Detected thinking model from arch/id: ${model.id} (arch: ${model.arch}) — will suppress thinking\n`);
+          process.stderr.write(`[houtini-lm] Detected thinking model from arch/id: ${model.id}${model.upstream ? ` (→ ${model.upstream})` : ''} (arch: ${model.arch}) — will suppress thinking\n`);
         }
+        // Store the upstream as the architecture hint so read-time detection
+        // (getThinkingSupport) re-derives the same answer for the alias.
+        const archHint = model.arch || model.upstream;
         await upsertProfile({
           modelId: model.id,
           hfId: null,
           pipelineTag: model.type || null,
-          architectures: model.arch ? JSON.stringify([model.arch]) : null,
+          architectures: archHint ? JSON.stringify([archHint]) : null,
           license: null,
           downloads: null,
           likes: null,
           libraryName: null,
-          family: inferFamily(model.id.split('/').pop() || model.id, model.publisher || ''),
-          description: `${model.publisher ? model.publisher + "'s " : ''}local model. No HuggingFace card found.`,
+          family: inferFamily(nameForDetection.split('/').pop() || nameForDetection, model.publisher || ''),
+          description: model.upstream
+            ? `Router alias for ${model.upstream}. No HuggingFace card found.`
+            : `${model.publisher ? model.publisher + "'s " : ''}local model. No HuggingFace card found.`,
           strengths: null,
           weaknesses: null,
           bestFor: null,
@@ -1127,7 +1144,15 @@ export function fitPrefillLinear(samples: PrefillSample[]): PrefillFit | null {
 
   // Zero variance in X — every sample was the same prompt size. Can't fit
   // a meaningful slope; caller should fall back to the simpler estimator.
-  if (denX <= 0) return null;
+  // Check the raw inputs, not `denX <= 0`: after recency weighting the
+  // weighted mean carries floating-point error, so identical inputs leave
+  // denX ~1e-26 rather than exactly 0 and a garbage slope slipped through.
+  let minX = Infinity, maxX = -Infinity;
+  for (const s of samples) {
+    if (s.promptTokens < minX) minX = s.promptTokens;
+    if (s.promptTokens > maxX) maxX = s.promptTokens;
+  }
+  if (maxX === minX || !(denX > 1e-9)) return null;
 
   const beta = num / denX;
   const alpha = meanY - beta * meanX;

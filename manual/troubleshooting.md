@@ -18,6 +18,8 @@ Three fixes, in order:
 
 If your client is the ignoring kind: split the work into smaller calls ([micro-chunking](delegation.md#micro-chunking-on-slow-hardware)), or trim the input. The `code_task_files` pre-flight estimator exists precisely to refuse calls that would die this death - a refusal with a diagnostic beats sixty silent seconds and an error.
 
+**Running houtini-lm behind an MCP gateway** (the Docker MCP Gateway, or any proxy that wraps the stdio server in HTTP) adds a hop that may not pass the progress notifications through. We've watched a ~6,000-token generation time out that way while the same work split into two calls of ~1,000-2,000 tokens each finished in 19s and 27s. If long calls die behind a gateway, chunk them.
+
 ## code_task_files refuses with "estimated prefill time exceeds the ~60s MCP client timeout"
 
 **The estimator thinks your hardware can't prefill this input in time.** It learns from measured (prompt_tokens, TTFT) pairs per model, weights recent samples over stale ones, and only refuses on a fit it trusts (R² ≥ 0.5).
@@ -50,7 +52,15 @@ The backend needs an actual embedding model loaded. A chat model doesn't serve `
 
 ## The model gives mangled or truncated-feeling output on big inputs
 
-Check the model's real context window in `discover`, not the family's advertised one - a 128k-family model loaded at 32k on a small GPU is a 32k model, and everything past the window is silently gone from its view. The dynamic output budget follows the *loaded* window, but your prompt still has to fit in what's left.
+Check the model's real context window in `discover`, not the family's advertised one - a 128k-family model loaded at 32k on a small GPU is a 32k model, and everything past the window is silently gone from its view. The dynamic output budget follows the *loaded* window, but your prompt still has to fit in what's left. If `discover` says the context is "not reported (assuming …)", houtini-lm is guessing - set `HOUTINI_LM_CONTEXT_WINDOW` to the real figure.
+
+## Work lands on the wrong model behind a router
+
+**Nothing pinned, so ties go to the first listed alias.** A LiteLLM router (or OpenRouter) lists many models that all score the same in routing, and on a tie the first one wins. If your router lists a local GPU model first, that's where every unpinned call goes - including from Claude sessions you meant to point at a cloud tier. `discover` warns about this in its `Routing:` line. Set `HOUTINI_LM_MODEL` to the alias you want as the default, or pass `model` on the call.
+
+## Stats reset every session, and the prefill estimator never learns
+
+**The server is running in a fresh container each time.** houtini-lm keeps its lifetime stats, model profiles and prefill samples in `~/.houtini-lm/model-cache.db`. Under the Docker MCP Gateway (or anything that starts a new container per session), that directory is thrown away with the container - so `stats` restarts from zero, every model is re-profiled at startup, and the `code_task_files` estimator is back to its conservative default every time. The cross-process lock is container-local too, so it can't serialise between sessions. Mount a persistent volume at the container's `~/.houtini-lm` and all of it survives.
 
 ## Stats look wrong after switching backends
 

@@ -21,7 +21,7 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'node:url';
 
-const REPO = dirname(fileURLToPath(import.meta.url));
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const DELEGATION_OVERHEAD = 250; // MCP tool call envelope (tokens)
 
