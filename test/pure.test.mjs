@@ -14,6 +14,8 @@ import {
   parseRetryAfter,
   extractStreamError,
   buildSystemPrompt,
+  resolveThinkingOverride,
+  GROUNDING_LINE,
 } from '../dist/pure.js';
 
 test('estimatePromptTokens', () => {
@@ -160,7 +162,11 @@ test('extractStreamError', () => {
 });
 
 test('buildSystemPrompt', () => {
-  const grounding = 'Base your answer only on the information provided in this conversation. If it is insufficient to answer correctly, say what is missing rather than guessing.';
+  const grounding = GROUNDING_LINE;
+  // Scoped to supplied material: an unscoped "only from this conversation" line
+  // made literal models refuse open-ended writing.
+  assert.ok(/own knowledge/.test(grounding));
+  assert.ok(!/only on the information/.test(grounding));
   const plain = buildSystemPrompt({
     base: '  Base prompt \n', formatLine: '  Format marker  ',
     modelConstraint: '  Constraint marker  ',
@@ -182,4 +188,19 @@ test('buildSystemPrompt', () => {
   const whitespace = buildSystemPrompt({ base: '  Base prompt  ', formatLine: ' \n\t ' });
   assert.equal(whitespace, `Base prompt\n\n${grounding}`);
   assert.ok(buildSystemPrompt({ base: '' }).includes(grounding));
+});
+
+test('resolveThinkingOverride', () => {
+  // Explicit modes win over detection (PR #34: 'on' used to be ignored).
+  assert.equal(resolveThinkingOverride('on', true), true);
+  assert.equal(resolveThinkingOverride('on', false), true);
+  assert.equal(resolveThinkingOverride('ON ', true), true);
+  assert.equal(resolveThinkingOverride('off', true), false);
+  assert.equal(resolveThinkingOverride('off', false), false);
+  // auto / unset / unknown: suppress only detected thinking models.
+  assert.equal(resolveThinkingOverride('auto', true), false);
+  assert.equal(resolveThinkingOverride(undefined, true), false);
+  assert.equal(resolveThinkingOverride('auto', false), undefined);
+  assert.equal(resolveThinkingOverride('', false), undefined);
+  assert.equal(resolveThinkingOverride('maybe', false), undefined);
 });

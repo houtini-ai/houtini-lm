@@ -42,6 +42,7 @@ import {
   autoOutputBudget,
   capOutputBudget,
   inflateForThinking,
+  resolveThinkingOverride,
   isConfidentPrefillEstimate,
   extractSamplingParams,
   validTemperature,
@@ -991,28 +992,36 @@ async function chatCompletionStreamingInner(
     // never fires — the answer then lands in reasoning_content with empty content.
     // HOUTINI_LM_THINKING=off forces no-think for every call regardless of
     // detection (correct when an orchestrator does the reasoning and the local
-    // model only executes). 'on' would force the opposite; unset/'auto' keeps
-    // detection. Only ever suppresses thinking — never fabricates it.
-    const thinkingMode = (process.env.HOUTINI_LM_THINKING || 'auto').toLowerCase();
-    if (thinkingMode === 'off' || thinking?.supportsThinkingToggle) {
-      body.enable_thinking = false;
+    // model only executes); 'on' forces thinking on; unset/'auto' suppresses
+    // it only for models detected as supporting the toggle.
+    const enableThinking = resolveThinkingOverride(
+      process.env.HOUTINI_LM_THINKING,
+      Boolean(thinking?.supportsThinkingToggle),
+    );
+    if (enableThinking !== undefined) {
+      body.enable_thinking = enableThinking;
       // vLLM's OpenAI server ONLY honours the toggle when it is nested inside
       // chat_template_kwargs; a top-level enable_thinking is silently dropped
       // (LM Studio / Ollama accept the top-level form). Without this, vLLM
       // thinking models (Qwen3.6, Qwen3-Coder-Next) return the answer in
       // reasoning_content with empty content. Send both shapes for portability.
-      body.chat_template_kwargs = { ...(body.chat_template_kwargs as Record<string, unknown> | undefined), enable_thinking: false };
-      const reasoningValue = getReasoningEffortValue(modelId);
-      if (reasoningValue !== null) {
-        body.reasoning_effort = reasoningValue;
+      body.chat_template_kwargs = { ...(body.chat_template_kwargs as Record<string, unknown> | undefined), enable_thinking: enableThinking };
+      let reasoningValue: string | null = null;
+      if (!enableThinking) {
+        reasoningValue = getReasoningEffortValue(modelId);
+        if (reasoningValue !== null) {
+          body.reasoning_effort = reasoningValue;
+        }
       }
-      // Inflation uses effectiveMaxTokens (the context-aware value), not
+      // Inflate in both directions: suppression is a request some templates
+      // ignore, and forced thinking is exactly when reasoning eats the budget.
+      // Uses effectiveMaxTokens (the context-aware value), not
       // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
       const beforeInflation = effectiveMaxTokens;
       const inflated = capToContext(inflateForThinking(beforeInflation));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
-      process.stderr.write(`[houtini-lm] Thinking model ${modelId}${upstream ? ` (→ ${upstream})` : ''}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}${upstream ? ` (→ ${upstream})` : ''}: ${enableThinking ? 'enable_thinking=true (forced by HOUTINI_LM_THINKING=on)' : `reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false`}, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 
