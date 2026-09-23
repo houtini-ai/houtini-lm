@@ -5,15 +5,15 @@ Status: **scoped, not built.** A bit of design so this can be picked up cleanly.
 ## Why
 
 houtini-lm runs as an MCP server over stdio. That's right for a human in Claude
-Code — but for an *orchestrator driving the fleet from a terminal* the MCP layer
+Code - but for an *orchestrator driving the fleet from a terminal* the MCP layer
 adds friction:
 
 - **The MCP client imposes a ~60s tool-call timeout.** Reasoning models (DeepSeek,
-  Kimi) routinely exceed it on real work — a live code review took **60.7s and only
+  Kimi) routinely exceed it on real work - a live code review took **60.7s and only
   completed when run outside the MCP**; through `code_task_files` it timed out.
 - **The transport is opaque from a shell.** Scripting delegation today means either
   the MCP (with its ceiling) or a hand-rolled curl that *duplicates* houtini-lm's
-  logic — the no-think toggle nesting, the context-overflow retry, token sizing,
+  logic - the no-think toggle nesting, the context-overflow retry, token sizing,
   stats. (A stopgap `fleet.mjs` in the `local-llm` repo does exactly this; CLI mode
   obsoletes it.)
 
@@ -84,7 +84,7 @@ Global: `--endpoint`, `--api-key` (fall back to the same env vars as MCP), `--ti
 
 - Unit: argv → args-object mapping per command (pure, no backend).
 - Integration: `node dist/index.js discover` and `… chat --model local "say hi"` against
-  a live endpoint — assert non-empty stdout + exit 0.
+  a live endpoint - assert non-empty stdout + exit 0.
 - **Regression:** `node dist/index.js` with no args still starts the MCP server.
 
 ## Out of scope / open

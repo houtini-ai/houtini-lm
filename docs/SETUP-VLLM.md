@@ -1,6 +1,6 @@
 # Setup: vLLM as a houtini-lm backend
 
-vLLM is the throughput option — continuous batching, real tool-calling, KV-cache
+vLLM is the throughput option - continuous batching, real tool-calling, KV-cache
 quantization for long context. It serves an OpenAI-compatible API that houtini-lm
 talks to directly. This guide gets it running and wired, and covers the handful of
 traps that make a delegated call come back empty or garbled if you miss them.
@@ -8,7 +8,7 @@ traps that make a delegated call come back empty or garbled if you miss them.
 > For the deeper "why it behaves this way" reference (reasoning-model token budgets,
 > the router topology, parser dialects), see [VLLM-BACKEND.md](./VLLM-BACKEND.md).
 > Prefer a desktop GUI with zero config? Use [SETUP-LMSTUDIO.md](./SETUP-LMSTUDIO.md)
-> instead — vLLM is worth it when you want throughput, parallel agents, or big context.
+> instead - vLLM is worth it when you want throughput, parallel agents, or big context.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ traps that make a delegated call come back empty or garbled if you miss them.
 
 ## 1. Start the server
 
-The minimal Docker invocation — one model, OpenAI API on port 8000:
+The minimal Docker invocation - one model, OpenAI API on port 8000:
 
 ```bash
 docker run --gpus all -p 8000:8000 \
@@ -30,7 +30,7 @@ docker run --gpus all -p 8000:8000 \
   --max-model-len 65536
 ```
 
-- `--served-model-name` gives the model a **short, stable alias** (here `coder`). houtini-lm and every client use this name; it stays constant when you change the underlying quant. Remember it — it matters in step 3.
+- `--served-model-name` gives the model a **short, stable alias** (here `coder`). houtini-lm and every client use this name; it stays constant when you change the underlying quant. Remember it - it matters in step 3.
 - `-v ...huggingface` caches weights so restarts don't re-download.
 - Watch startup with `docker logs -f <container>`. It's ready when you see `Application startup complete`.
 
@@ -41,13 +41,13 @@ curl http://localhost:8000/v1/models      # lists the served-model-name
 curl http://localhost:8000/health         # 200 when live
 ```
 
-> `/v1/models` answering is **not** proof the model is resident and fast — only a real
+> `/v1/models` answering is **not** proof the model is resident and fast - only a real
 > completion is. See the cold-start note under Traps.
 
 ## 2. Match the tool-call parser to the model family
 
 vLLM translates each model's native tool dialect to the standard OpenAI `tool_calls`
-schema — **but only if you pass the right parser.** The wrong one makes tool calls
+schema - **but only if you pass the right parser.** The wrong one makes tool calls
 leak into `content` as raw XML/JSON text (this was the classic "local tool-calling is
 broken" symptom).
 
@@ -55,8 +55,8 @@ broken" symptom).
 |---|---|---|
 | Qwen3 / Qwen3-Coder | `qwen3_xml` (alias `qwen3_coder`) | `qwen3` (thinking models) |
 | Gemma 3/4 | `gemma4` | `gemma4` |
-| Hermes / many Instruct | `hermes` | — (no thinking) |
-| Llama 3.x | `llama3_json` | — |
+| Hermes / many Instruct | `hermes` | - (no thinking) |
+| Llama 3.x | `llama3_json` | - |
 
 If tool calls misbehave, check `docker logs` for a parser warning before blaming the model.
 
@@ -72,12 +72,12 @@ Set these in houtini-lm's `env` (in your Claude Code / Claude Desktop MCP config
 }
 ```
 
-- **`HOUTINI_LM_ENDPOINT_URL`** — the vLLM address. On Windows/PowerShell use
-  `http://127.0.0.1:8000` (not `localhost` — WSL2 mirrored networking resolves it to
+- **`HOUTINI_LM_ENDPOINT_URL`** - the vLLM address. On Windows/PowerShell use
+  `http://127.0.0.1:8000` (not `localhost` - WSL2 mirrored networking resolves it to
   IPv6 and times out). From another container, use `http://host.docker.internal:8000`.
-- **`HOUTINI_LM_THINKING=off`** — **the most important setting, and the one that bites.**
+- **`HOUTINI_LM_THINKING=off`** - **the most important setting, and the one that bites.**
   See the trap below.
-- **`HOUTINI_LM_SERIALISE=0`** — vLLM batches natively, so let parallel calls through
+- **`HOUTINI_LM_SERIALISE=0`** - vLLM batches natively, so let parallel calls through
   instead of queueing them one at a time (the default `1` is for single-stream backends).
 
 Restart Claude after changing MCP config. Then confirm from inside a session:
@@ -91,24 +91,28 @@ houtini-lm discover        # shows the model, context, and — after one call �
 ### Thinking models return empty content unless you force no-think
 A thinking model (Qwen3, DeepSeek-R1, GLM-4, gpt-oss) spends its output budget on
 hidden reasoning *before* the visible answer. With thinking on, the answer lands in
-`reasoning_content` and `content` comes back **empty** — looks like a model failure,
+`reasoning_content` and `content` comes back **empty** - looks like a model failure,
 isn't. Two parts to the fix, both handled by **`HOUTINI_LM_THINKING=off`**:
 - vLLM only honours the no-think toggle when it's **nested** in
-  `chat_template_kwargs: {enable_thinking: false}` — a top-level `enable_thinking` is
+  `chat_template_kwargs: {enable_thinking: false}` - a top-level `enable_thinking` is
   silently ignored. houtini-lm sends the nested shape.
 - houtini-lm decides *whether* to send it by identifying the model from Hugging Face
-  metadata — but your `--served-model-name` alias (e.g. `coder`) resolves to nothing on
+  metadata - but your `--served-model-name` alias (e.g. `coder`) resolves to nothing on
   HF, so a real thinking model looks non-thinking and the toggle never fires. `off`
-  forces it regardless. **This is required for any aliased vLLM model.**
+  forces it regardless. **This is required for any vLLM model served directly under
+  an alias.** (If you put a LiteLLM router in front, houtini-lm reads the router's
+  `/model/info`, resolves the alias to the real model and detects thinking on its own -
+  `off` is still the right call when Claude does the reasoning, but no longer the only
+  thing standing between you and empty replies.)
 
 Leave it `off` whenever an orchestrator (Claude) does the reasoning and the local model
-only executes — it's also ~4× faster.
+only executes - it's also ~4× faster.
 
 ### Don't cap `max_tokens` low
 The budget counts reasoning + answer together, so a low cap is burned on reasoning and
 returns empty content. houtini-lm inflates small caps and vLLM sizes to the context
 window, so normally pass nothing. If you set it, be generous (16k+; 32k for
-thinking-heavy work). A ceiling is not consumption — the model stops when done.
+thinking-heavy work). A ceiling is not consumption - the model stops when done.
 
 ### One model at a time
 vLLM loads a single model. Switching means restarting the container with a new
@@ -136,6 +140,6 @@ houtini-lm chat  message="Reply with exactly one word: ok"       # warms the mod
 houtini-lm chat  message="Write a Python function that reverses a string. Code only."
 ```
 
-Non-empty `content` on the second call means the wiring — endpoint, parser, no-think —
+Non-empty `content` on the second call means the wiring - endpoint, parser, no-think - 
 is correct. If `content` is empty but `reasoning_content` is full, re-check
 `HOUTINI_LM_THINKING=off`.

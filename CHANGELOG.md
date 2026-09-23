@@ -1,5 +1,44 @@
 # Changelog
 
+## [3.3.0] - 2026-09-23
+
+Router-aware, and properly tested. Verified live against a LiteLLM router fronting a local vLLM model plus hosted DeepSeek and OpenAI tiers.
+
+### Added
+- **LiteLLM router support.** houtini-lm now reads a router's `/model/info` alongside `/v1/models` and uses what it finds. Aliases resolve to the real model behind them (`local` → `qwen3.6-27b`), so profiles, prompt hints and thinking detection work on the real name - a thinking model behind an alias now gets the no-think toggle automatically, where before it needed `HOUTINI_LM_THINKING=off`. Hosted models bring their true context window and output cap. Models that can't chat (image, video, audio, realtime, moderation - 128 of 239 entries on the test router) are left out of `discover`, `list_models` and routing. Routers get 429/5xx backoff by default. Detection is best-effort: no key, a 401, or a non-LiteLLM endpoint behaves exactly as before, and a definitive "not a router" answer is remembered so plain vLLM/llama.cpp endpoints don't pay for the probe twice.
+- **Structured tool output.** The five inference tools (`chat`, `custom_prompt`, `code_task`, `code_task_files`, `embed`) return `structuredContent` alongside the text - model id, token usage (prompt / completion / reasoning / cached), TTFT and tok/s, quality flags, finish reason and the running quota counters (`embed` returns the embedding object). An orchestrator can branch on these without parsing the footer. The answer stays in the text block, so nothing is duplicated, and no `outputSchema` is declared yet (see TODO) so every client renders the answer exactly as before.
+- **`HOUTINI_LM_RETRY_RATELIMIT=1`** opts any backend into 429/5xx backoff, for proxies other than OpenRouter and LiteLLM that front a rate-limited API. `HOUTINI_LM_PROVIDER=litellm` forces router handling.
+- **Unit tests and CI.** A `node:test` suite (21 tests) over the new side-effect-free modules `src/pure.ts` and `src/litellm.ts`, plus the prefill fit and alias thinking detection in `model-cache`. `npm test` builds and runs it; a GitHub Actions workflow runs it with the overflow and lock tests on Node 22 and 24. Two of the three test files were drafted by a delegated model through houtini-lm itself and reviewed before commit.
+- **Model profiles** for DeepSeek, Google Gemma and OpenAI's hosted GPT-5/6 family; the Kimi profile now covers K3 as well as K2.
+
+### Fixed
+- **Budgets were sized from the wrong model.** The output budget came from whichever model the backend listed *first*, not the model the call was sent to - so on any multi-model backend (a router, OpenRouter, LM Studio with two models loaded) a pinned call was sized from someone else's context window. Budgets now come from the targeted model.
+- **Budgets could exceed a model's output cap.** Reading a hosted model's real context window (e.g. 922k) would have made the 25%-of-context default ~230k tokens, past a 128k output cap and into a 400. Every budget - including the thinking-model inflation - is now clamped to the model's declared max output as well as to the room beside the prompt.
+- **`code_task_files` falsely refused large inputs to hosted models.** With fewer than five timing samples the pre-flight estimator falls back to a ratio (total prompt tokens ÷ total TTFT), which folds fixed network and queueing overhead into the rate. Two 72-token calls to a hosted model at ~3.5s TTFT read as "20 tok/s", and extrapolating that 190× predicted ~11 minutes of prefill for a 14k-token review the model then completed in 40 seconds. A ratio estimate may now only refuse a call while it's interpolating - the input within 4× of the largest prompt actually measured. Found by running this release's own code review through `code_task_files`.
+- **`fitPrefillLinear` returned a garbage fit instead of `null` for identical prompt sizes.** Since recency weighting landed, floating-point error left the variance at ~1e-26 rather than 0, so the zero-variance guard never fired. The R² ≥ 0.5 gate kept it from ever refusing a call, but the contract was broken. Found by the new unit tests.
+- **`discover` could list hundreds of models.** On a router or OpenRouter it now shows the first dozen and a count; `list_models` switches to one line per model past 30. Both show the real model behind an alias and the output cap.
+- **`discover` showed ○ ("not loaded") for every model** on backends that don't report load state, under a "● ready to use" heading. It now shows ●.
+- **`discover` claimed a 100,000-token context it had made up.** When the backend doesn't report a window it now says so and points at `HOUTINI_LM_CONTEXT_WINDOW`.
+- **`server.json` was a version behind.** It still said 3.2.3 while 3.2.4 was on npm, so the MCP registry manifest lagged the package. Both now read 3.3.0.
+
+### Changed
+- **`discover` reports the model unpinned calls will actually land on**, flags `HOUTINI_LM_MODEL` when pinned, and warns when nothing is pinned on a multi-model backend - on a tie, unpinned work goes to the first listed model, which on a router is often a local GPU.
+- **Routing** never sends a chat/code/analysis task to an embedding model, and the code-task bonus now reads profiles auto-generated from HuggingFace, not just the hardcoded list.
+- **The model list is cached for 30 seconds** for inference and routing, so a router isn't queried twice per call. `discover` and `list_models` always fetch live.
+- **Internals:** `formatFooter` no longer records usage as a side effect (callers record once, explicitly); the side-effect-free helpers moved out of `index.ts` into `src/pure.ts` so they can be tested.
+
+### Documented
+- LiteLLM router behaviour (README, VLLM-BACKEND), SGLang as the backend for repeated-context agent loops (GETTING-STARTED), and three new troubleshooting entries: work landing on the wrong model behind a router, stats resetting every session under the Docker MCP Gateway, and gateway-hop timeouts.
+
+## [3.2.4] - 2026-08-15
+
+### Fixed
+- **Inference-lock hang.** The cross-process lock's acquire loop is now bounded on every path (including the steal path), and the lock file descriptor no longer leaks when a write fails (#33).
+- **LICENSE file said MIT** while `package.json` and the README said Apache-2.0; the file now matches.
+
+### Documented
+- The manual (`manual/tools.md`, `delegation.md`, `troubleshooting.md`), an Ollama setup guide, a registry-ready `server.json` with an OIDC publish workflow, and a repo tidy for a public audience.
+
 ## [3.2.3] - 2026-08-03
 
 ### Fixed
