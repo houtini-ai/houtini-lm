@@ -79,6 +79,44 @@ the ~2,900-line `index.ts`: `routeToModel`, `formatFooter`, `assessQuality`,
 on module state (session counters, the detected backend), so extracting them
 means passing that state in - worth it for test coverage of routing in particular.
 
+### Derive prompt settings from the model card (M) - next headline feature
+
+`getPromptHints()` is a hand-maintained regex table, and a model newer than the
+table falls through to defaults that can be actively wrong. Measured 2026-08-12 on
+Nemotron 3 Super 120B, six-phase build, same prompts and hardware: defaults
+finished 2/6 phases on 58,747 output tokens; the model card's own settings
+(temperature 1.0, `enable_thinking: false`, an explicit "fence your code") finished
+6/6 on 18,481. `lookupHF()` never fetches the README, which is where that guidance
+lives. The prototype is `scripts/derive-prompt-schema.mjs <hf-id>` (PR #32).
+
+Integration: extend `PromptHints` with `topP`, `reasoningOff`, `reasoningParser`,
+`toolParser`, `likelyStripsFences`; run the deriver on a cache miss before the
+regex table; persist beside the profile in SQLite. 3.3.0 makes this better than
+when it was prototyped: behind a router, derive from `upstream_model` (the real
+HF id), not the alias. Two findings to design around - model cards go stale
+(Nemotron's card names the `super_v3` parser, which vLLM now rejects in favour of
+`nemotron_v3`), and cards document deprecated methods beside current ones (the
+deriver flags that as `ambiguous`). Derive automatically, verify against the
+runtime before trusting.
+
+### Model download and local store (M)
+
+From the 2026-08-10 Muse Glimmer test: vLLM's in-container loader stalled twice in
+anonymous HuggingFace rate-limit retries, fixed by a host-side `snapshot_download`
+and serving from a local path. Make it a houtini-lm capability: `download_model` /
+`list_local_models` with token-authenticated (`HF_TOKEN`), resumable pulls and a
+disk-space check first, and the local model store as a concept `discover` can
+report beside the router view.
+
+### Generator/critic pairs (M)
+
+When two models are up at the same time (two single-GPU models, or a local model
+plus a cloud tier), one can draft and the other critique, then re-check the
+revision. Today that pattern lives only in prose in the `delegate` skill; a
+`pair_review` tool, or `discover` pointing out "these two can pair", would let any
+session use it without re-deriving it. Overlaps with the verify-and-escalate
+cascade above - design them together.
+
 ### Small
 
 - **Footer em-dashes (optional, touches snapshots).** Runtime output uses
