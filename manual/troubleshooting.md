@@ -18,7 +18,7 @@ Three fixes, in order:
 
 If your client is the ignoring kind: split the work into smaller calls ([micro-chunking](delegation.md#micro-chunking-on-slow-hardware)), or trim the input. The `code_task_files` pre-flight estimator exists precisely to refuse calls that would die this death - a refusal with a diagnostic beats sixty silent seconds and an error.
 
-**Running houtini-lm behind an MCP gateway** (the Docker MCP Gateway, or any proxy that wraps the stdio server in HTTP) adds a hop that may not pass the progress notifications through. We've watched a ~6,000-token generation time out that way while the same work split into two calls of ~1,000-2,000 tokens each finished in 19s and 27s. If long calls die behind a gateway, chunk them.
+**Running houtini-lm behind an MCP gateway** (the Docker MCP Gateway, or any proxy that wraps the stdio server in HTTP) adds a hop that may not pass the progress notifications through, and on the Docker MCP Gateway build we run, it doesn't: houtini-lm sent 140 progress notifications during a 75-second call and the client received none of them. Raise the client's tool timeout (`MCP_TOOL_TIMEOUT`, in milliseconds, for Claude Code), chunk long work, or run houtini-lm with plain `docker run -i` or `npx` for long jobs. [Running houtini-lm in Docker](docker.md#long-calls-behind-the-gateway) has the full trace.
 
 ## code_task_files refuses with "estimated prefill time exceeds the ~60s MCP client timeout"
 
@@ -61,6 +61,14 @@ Check the model's real context window in `discover`, not the family's advertised
 ## Stats reset every session, and the prefill estimator never learns
 
 **The server is running in a fresh container each time.** houtini-lm keeps its lifetime stats, model profiles and prefill samples in `~/.houtini-lm/model-cache.db`. Under the Docker MCP Gateway (or anything that starts a new container per session), that directory is thrown away with the container - so `stats` restarts from zero, every model is re-profiled at startup, and the `code_task_files` estimator is back to its conservative default every time. The cross-process lock is container-local too, so it can't serialise between sessions. Mount a persistent volume at the container's `~/.houtini-lm` and all of it survives.
+
+## The model refuses and lists what's "missing"
+
+**An older grounding line, taken literally.** Before 3.3.1, every system prompt told the model to answer only from the information in the conversation. Literal models (GPT-6, DeepSeek V4) then declined open-ended writing that needed their own knowledge and politely listed what was missing. 3.3.1 scopes the line to code, files and data you've supplied, so upgrade; on an older version, put the material in the prompt or use `custom_prompt` with your own system line.
+
+## A 400 saying a parameter isn't supported
+
+**The upstream model rejects something houtini-lm sends.** GPT-6, for example, refuses `temperature` and `max_tokens`. Behind a LiteLLM router, give that model a named route that drops them ([Models that reject parameters](models.md#models-that-reject-parameters)); straight to a provider, open an issue with the error text.
 
 ## Stats look wrong after switching backends
 

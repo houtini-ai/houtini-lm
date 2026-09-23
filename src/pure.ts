@@ -250,7 +250,37 @@ export function extractStreamError(json: unknown): string | undefined {
   return JSON.stringify(err);
 }
 
+// ── Thinking mode ───────────────────────────────────────────────────
+
+/**
+ * Resolve HOUTINI_LM_THINKING into the enable_thinking value sent to the
+ * backend, or undefined to send nothing. `on` / `off` are explicit operator
+ * overrides; `auto` (and anything unrecognised) suppresses thinking only when
+ * detection says the model supports the toggle, and otherwise leaves the
+ * backend default alone. Ported from PR #34 (pinboxltd).
+ */
+export function resolveThinkingOverride(
+  rawMode: string | undefined,
+  supportsThinkingToggle: boolean,
+): boolean | undefined {
+  const mode = (rawMode || 'auto').trim().toLowerCase();
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  return supportsThinkingToggle ? false : undefined;
+}
+
 // ── Prompt composition ──────────────────────────────────────────────
+
+/**
+ * Anti-hallucination line added to every system prompt. Scoped to material
+ * supplied in the conversation: an earlier "answer only from this conversation"
+ * wording made literal models (gpt-6-astra, deepseek-v4) refuse open-ended
+ * writing that needs their own knowledge, listing what was "missing".
+ */
+export const GROUNDING_LINE =
+  'When the task depends on code, files or data provided in this conversation, work from that material ' +
+  'and do not invent details of it; if something you need from it is missing, say what rather than guessing. ' +
+  'For everything else, answer from your own knowledge.';
 
 /**
  * Compose the system prompt sent to the local model. Guarantees a non-empty,
@@ -270,10 +300,7 @@ export function buildSystemPrompt(opts: {
   structuredOutput?: boolean;
 }): string {
   const layers: string[] = [opts.base.trim()];
-  layers.push(
-    'Base your answer only on the information provided in this conversation. ' +
-    'If it is insufficient to answer correctly, say what is missing rather than guessing.',
-  );
+  layers.push(GROUNDING_LINE);
   if (opts.structuredOutput) {
     layers.push('Return only valid JSON conforming to the requested schema — no prose, no markdown, no code fences.');
   } else {

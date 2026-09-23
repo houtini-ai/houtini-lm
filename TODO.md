@@ -47,21 +47,24 @@ transparently farm delegatable tool calls out. Biggest moat, biggest risk (fight
 the client's own routing). The cascade is the tractable 80% - spike this, don't
 commit to it.
 
-### Docker MCP Gateway gaps (S, deployment + docs)
+### Parameters hosted reasoning models reject (S-M)
 
-- **Ephemeral state.** The gateway starts a fresh container per session, so
-  `~/.houtini-lm` - lifetime stats, profiles, prefill samples, the lock file - is
-  thrown away every time (troubleshooting.md now says to mount a volume). Worth
-  doing on this fleet's gateway config, and worth a line in the setup guides once
-  the gateway's volume syntax is confirmed.
-- **Progress notifications.** A ~6k-token generation timed out through the
-  gateway while the same work in two ~1-2k chunks finished in 19s and 27s.
-  Confirm whether `docker/mcp-gateway` forwards `notifications/progress`; if it
-  doesn't, that's an upstream issue, and chunking is the workaround.
-- **Pin the default model in the gateway config.** It sets endpoint, key,
-  serialise and thinking, but not `HOUTINI_LM_MODEL` - so unpinned calls from any
-  session go to `local`, the GPU. `astra` (or a DeepSeek tier) is probably the
-  intended default.
+GPT-6 (`gpt-6-astra`) returns a 400 on `temperature` and `max_tokens`, both of
+which houtini-lm always sends; the fleet works around it with a LiteLLM route
+using `additional_drop_params` (manual/models.md). Straight to OpenAI it would
+fail. For the GPT-5/6 and o-series families, send `max_completion_tokens` only
+and omit `temperature`/`top_p` - a per-family "parameter policy" beside
+`PROMPT_HINTS`. Verify against the provider's current docs (context7) first.
+
+### Docker MCP Gateway: progress relay (S, upstream)
+
+Measured 2026-09-23: through `docker/mcp-gateway:latest` (July 2026 build)
+houtini-lm sent 140 `notifications/progress` during a 75s call and the HTTP client
+received none, so the client's ~60s timeout still kills long calls. The gateway's
+current `main` has relay code (`pkg/mcp/mcp_client.go`); re-pull and re-run the
+probe. If it's still broken, file upstream. This is also the one argument for
+reviving native HTTP transport (below). Volume, pinned model and the 3.3.0 image
+are done on the fleet and documented in manual/docker.md.
 
 ### Lazy re-profiling (S)
 

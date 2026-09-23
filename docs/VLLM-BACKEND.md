@@ -71,11 +71,9 @@ Two causes, both fixed in source and verified end-to-end against live Qwen3-Code
 **Fix for the detection gap: `HOUTINI_LM_THINKING`** (`auto` | `off` | `on`, default `auto`).
 - `off` forces the no-think path for every call regardless of detection - the correct setting when Claude orchestrates and the local model only executes, and **required** for any vLLM model served under an alias.
 - `auto` keeps HF-metadata detection (fine for LM Studio / Ollama where the model id is the real one).
-- `on` forces thinking on.
+- `on` forces thinking on (`enable_thinking: true` in both shapes, with the output budget still inflated). Before 3.3.1 this setting was ignored for detected thinking models, which were always sent `false` - fixed from PR #34.
 
-Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `scripts/test-vllm-thinking.mjs` (`npm run test:vllm`).
-
-> Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. for hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
+Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `scripts/test-vllm-thinking.mjs` (`npm run test:vllm`) and the `resolveThinkingOverride` unit test. When each setting is worth it is covered in [the models page](../manual/models.md#thinking-auto-off-or-on).
 
 ## Caveat 2 - tool calls
 
