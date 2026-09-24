@@ -7,7 +7,7 @@
  *
  * Uses node:sqlite (Node's built-in SQLite, Node >=22.5) in WAL mode, so
  * multiple houtini-lm processes sharing this file get real cross-process
- * concurrency — per-row writes and proper locking instead of whole-file
+ * concurrency - per-row writes and proper locking instead of whole-file
  * snapshots. Built into Node, so no third-party native dependency and no build
  * step. Existing sql.js databases are standard SQLite and open unchanged.
  */
@@ -214,7 +214,7 @@ let cacheDisabled = false;
  * synchronous and writes persist directly (no snapshot, no init race). WAL +
  * busy_timeout give multiple processes safe concurrent access to one file.
  * Kept async so existing `await initDb()` callers don't change; returns null when
- * the cache is unavailable — every caller guards on that.
+ * the cache is unavailable - every caller guards on that.
  */
 export async function initDb(): Promise<DatabaseSyncType | null> {
   if (db) return db;
@@ -228,7 +228,7 @@ export async function initDb(): Promise<DatabaseSyncType | null> {
   } catch (err) {
     cacheDisabled = true;
     process.stderr.write(
-      `[houtini-lm] Model cache disabled — node:sqlite unavailable (${err}). ` +
+      `[houtini-lm] Model cache disabled - node:sqlite unavailable (${err}). ` +
       `Upgrade to Node >=22.13, or run with --experimental-sqlite on Node 22.5–22.12. ` +
       `The server still works; model profiling and cross-session stats are off.\n`,
     );
@@ -239,7 +239,7 @@ export async function initDb(): Promise<DatabaseSyncType | null> {
 function openConnection(Ctor: DbCtor): DatabaseSyncType {
   const database = new Ctor(DB_PATH);
   // busy_timeout MUST come first: it makes every subsequent locked operation —
-  // including the WAL switch and all writes — wait for the lock instead of
+  // including the WAL switch and all writes - wait for the lock instead of
   // throwing SQLITE_BUSY. Without it, concurrent processes opening the same file
   // collide on the journal-mode switch. Then enable WAL (persistent once set) so
   // multiple processes get concurrent readers + a serialised writer.
@@ -249,18 +249,18 @@ function openConnection(Ctor: DbCtor): DatabaseSyncType {
   return database;
 }
 
-/** True only for errors that mean the file is genuinely unusable — NOT a
+/** True only for errors that mean the file is genuinely unusable - NOT a
  *  transient lock/busy, which must never trigger the destructive reset. */
 function isCorruptionError(err: unknown): boolean {
   return /malformed|not a database|file is encrypted|disk image|out of memory/i.test(String(err));
 }
 
-/** Move the corrupt DB aside — INCLUDING its -wal/-shm sidecars. SQLite
+/** Move the corrupt DB aside - INCLUDING its -wal/-shm sidecars. SQLite
  *  associates a WAL with a database by filename, so leaving the sidecars would
  *  make it replay the corrupt frames into the fresh DB. */
 function quarantineDbFiles(): void {
   for (const suffix of ['', '-wal', '-shm']) {
-    try { renameSync(`${DB_PATH}${suffix}`, `${DB_PATH}${suffix}.corrupt-${process.pid}`); } catch { /* absent — ignore */ }
+    try { renameSync(`${DB_PATH}${suffix}`, `${DB_PATH}${suffix}.corrupt-${process.pid}`); } catch { /* absent - ignore */ }
   }
 }
 
@@ -312,7 +312,7 @@ function openAndInit(Ctor: DbCtor): DatabaseSyncType {
     db.exec('ALTER TABLE model_profiles ADD COLUMN supports_thinking_toggle INTEGER NOT NULL DEFAULT 0');
   } catch { /* column already exists */ }
 
-  // Per-model performance history — accumulated across sessions.
+  // Per-model performance history - accumulated across sessions.
   db.exec(`
     CREATE TABLE IF NOT EXISTS model_performance (
       model_id TEXT PRIMARY KEY,
@@ -329,7 +329,7 @@ function openAndInit(Ctor: DbCtor): DatabaseSyncType {
     )
   `);
 
-  // Per-call prefill samples — used by the linear-fit pre-flight estimator.
+  // Per-call prefill samples - used by the linear-fit pre-flight estimator.
   // Stores (prompt_tokens, TTFT_ms) pairs so we can fit TTFT ≈ α + β·tokens
   // and separate fixed per-request overhead from real per-token prefill cost.
   // Capped at PREFILL_SAMPLES_PER_MODEL rows per model; oldest pruned on insert.
@@ -420,7 +420,7 @@ export async function upsertProfile(profile: CachedModelProfile, _skipSave = fal
   );
 }
 
-/** No-op — node:sqlite persists writes directly. Retained for compatibility. */
+/** No-op - node:sqlite persists writes directly. Retained for compatibility. */
 export function flushDb(): void {
   /* writes are persisted immediately by node:sqlite */
 }
@@ -511,10 +511,10 @@ function detectThinkingSupportFromArch(arch: string, modelId: string): { emitsTh
   // DeepSeek R1, gpt-oss). Detection uses both arch and id because HF cards
   // for gated/quant'd repos sometimes strip the chat_template.
   const thinkingArchitectures = [
-    'gemma4',         // Gemma 4 — enable_thinking hardcoded true in Jinja
+    'gemma4',         // Gemma 4 - enable_thinking hardcoded true in Jinja
     'nemotron',       // NVIDIA Nemotron reasoning models (nemotron_h, nemotron_h_moe)
     'deepseek2',      // DeepSeek R1 / V3 reasoning variants stream reasoning_content
-    'glm4',           // Zhipu GLM-4 — chain-of-thought in-band
+    'glm4',           // Zhipu GLM-4 - chain-of-thought in-band
     'gpt-oss',        // OpenAI open-source reasoning model
     'gpt_oss',
   ];
@@ -617,7 +617,7 @@ function inferProfileFromHF(card: HFModelCard, modelId: string): Partial<CachedM
   // Infer description
   let description = `${org ? org + "'s " : ''}${family} model.`;
   if (tag === 'text-generation') description += ' Text generation / chat model.';
-  else if (tag === 'image-text-to-text') description += ' Vision-language model — handles text and image inputs.';
+  else if (tag === 'image-text-to-text') description += ' Vision-language model - handles text and image inputs.';
   else if (tag === 'feature-extraction' || tag === 'sentence-similarity') description += ' Embedding model for semantic search.';
   const safeLicense = sanitizeCardText(card.cardData?.license, 40);
   if (safeLicense) description += ` License: ${safeLicense}.`;
@@ -719,11 +719,11 @@ interface ModelInfoForCache {
 
 /**
  * Profile all models at startup. For each model:
- * 1. Check SQLite cache — if fresh, skip
- * 2. Look up on HuggingFace — if found, auto-generate profile and cache
+ * 1. Check SQLite cache - if fresh, skip
+ * 2. Look up on HuggingFace - if found, auto-generate profile and cache
  * 3. If HF miss, cache as "inferred" with whatever metadata we have
  *
- * Runs in the background — never blocks server startup.
+ * Runs in the background - never blocks server startup.
  */
 export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promise<void> {
   const database = await initDb();
@@ -773,14 +773,14 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
         }, true);
         profiledCount++;
       } else {
-        // No HF match — cache a minimal profile so we don't retry.
+        // No HF match - cache a minimal profile so we don't retry.
         // Use architecture-based thinking detection as fallback for gated models.
         // Behind a router, detect from the upstream name: "local" says nothing,
         // "qwen3.6-27b" identifies a Qwen3 thinking model.
         const nameForDetection = model.upstream || model.id;
         const thinking = detectThinkingSupportFromArch(model.arch || '', nameForDetection);
         if (thinking.supportsThinkingToggle) {
-          process.stderr.write(`[houtini-lm] Detected thinking model from arch/id: ${model.id}${model.upstream ? ` (→ ${model.upstream})` : ''} (arch: ${model.arch}) — will suppress thinking\n`);
+          process.stderr.write(`[houtini-lm] Detected thinking model from arch/id: ${model.id}${model.upstream ? ` (→ ${model.upstream})` : ''} (arch: ${model.arch}) - will suppress thinking\n`);
         }
         // Store the upstream as the architecture hint so read-time detection
         // (getThinkingSupport) re-derives the same answer for the alias.
@@ -822,7 +822,7 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
 }
 
 /**
- * Get a profile for display — checks SQLite first, returns formatted enrichment line.
+ * Get a profile for display - checks SQLite first, returns formatted enrichment line.
  */
 export async function getHFEnrichmentLine(modelId: string): Promise<string> {
   const cached = await getCachedProfile(modelId);
@@ -956,7 +956,7 @@ export async function getLifetimeTotals(): Promise<{ totalTokens: number; totalC
 /**
  * Append a single call's usage + timing to the per-model performance record.
  * Creates the row on first use, upserts thereafter. Caller should fire-and-
- * forget — failures here must not block a tool response.
+ * forget - failures here must not block a tool response.
  */
 export async function recordPerformance(
   modelId: string,
@@ -1095,7 +1095,7 @@ export interface PrefillFit {
   alphaMs: number;
   /** Per-prompt-token cost (slope, ms/token). */
   betaMsPerToken: number;
-  /** Coefficient of determination — how well the line fits the data. */
+  /** Coefficient of determination - how well the line fits the data. */
   r2: number;
   /** Number of samples used. */
   n: number;
@@ -1112,7 +1112,7 @@ const PREFILL_FIT_HALF_LIFE_SAMPLES = 6;
 /**
  * Recency-weighted least-squares linear regression:
  * ttft_ms ≈ α + β·prompt_tokens, with sample weights decaying by half every
- * PREFILL_FIT_HALF_LIFE_SAMPLES samples (newest weighted highest — `samples`
+ * PREFILL_FIT_HALF_LIFE_SAMPLES samples (newest weighted highest - `samples`
  * arrives oldest-first). Returns null when there are too few samples or zero
  * variance in the inputs (e.g. every sample had the same prompt size).
  */
@@ -1142,7 +1142,7 @@ export function fitPrefillLinear(samples: PrefillSample[]): PrefillFit | null {
     denY += w * dy * dy;
   }
 
-  // Zero variance in X — every sample was the same prompt size. Can't fit
+  // Zero variance in X - every sample was the same prompt size. Can't fit
   // a meaningful slope; caller should fall back to the simpler estimator.
   // Check the raw inputs, not `denX <= 0`: after recency weighting the
   // weighted mean carries floating-point error, so identical inputs leave

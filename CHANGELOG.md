@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.3.2] - 2026-09-24
+
+### Fixed
+- **OpenAI's hosted reasoning models are sent only what they accept.** GPT-5, GPT-6 and the o-series reject `max_tokens` (deprecated in favour of `max_completion_tokens`, which also counts reasoning tokens), and GPT-6 returns a 400 on `temperature`. houtini-lm now recognises these families by name, directly or behind a router alias, and sends `max_completion_tokens` only, leaving out the sampling controls (`temperature`, `top_p`, `top_k`, `repeat_penalty`) and the open-weight thinking toggles, which OpenAI rejects as unrecognised arguments. They skip the `HOUTINI_LM_THINKING` path, since they manage their own reasoning, and the server log lists what was left out. Until now this only worked behind a LiteLLM route configured to strip the parameters; pointed straight at OpenAI, these models would have failed. Verified live on gpt-5.2 (through a route with no stripping) and gpt-6-astra. OpenRouter is unchanged, since it normalises parameters itself.
+- **Older OpenAI models were described as "local model".** The hosted-OpenAI profile only matched GPT-5 and GPT-6, so `gpt-4o-mini` or `gpt-3.5-turbo` behind a router fell through to a fallback that called them local. The profile now covers GPT-3.5 to GPT-6 and the o-series (gpt-oss keeps its own), and a cached pre-3.3 profile for a router alias is described as the alias it is.
+- **Models without a profile printed an empty "Best for:" line** in `discover` and `list_models`. It's left out now.
+- **Models weren't profiled if the endpoint was down at startup.** Profiling ran once at boot, so a GPU box still booting (or vLLM still loading) meant no profiles, and no thinking detection from them, for the whole session. It now runs on the first model list that has anything in it.
+
+### Changed
+- **Runtime output uses spaced hyphens instead of em-dashes** (the footer, tool descriptions, error messages), matching the docs.
+
 ## [3.3.1] - 2026-09-23
 
 ### Fixed

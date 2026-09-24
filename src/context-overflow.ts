@@ -1,16 +1,16 @@
 /**
- * context-overflow.ts — recover the real context limit from a backend's 400.
+ * context-overflow.ts - recover the real context limit from a backend's 400.
  *
  * Strict OpenAI-compatible backends (notably vLLM) reject a request when
  * prompt + max_tokens exceeds the model's context window with an HTTP 400,
  * rather than silently clamping. houtini-lm sizes its output budget from the
- * context it detects via /v1/models — but that number can be wrong when a
+ * context it detects via /v1/models - but that number can be wrong when a
  * proxy sits in front (e.g. a LiteLLM router advertising a generic 100k window
  * while the model actually loaded is 64k). The result is a spurious 400 on a
  * request that only overshot because the advertised context was too large.
  *
  * The server's own error message states the real limit. Parsing it lets the
- * caller retry once with a corrected budget — robust even when /v1/models
+ * caller retry once with a corrected budget - robust even when /v1/models
  * mis-reports the context behind a proxy, and self-correcting across backends.
  */
 
@@ -28,7 +28,7 @@
 export function parseContextOverflow(text: string): number | null {
   if (!text) return null;
   const patterns: RegExp[] = [
-    /max_model_len\D*([\d,]{2,})/i,               // vLLM — grabs the final number after max_model_len
+    /max_model_len\D*([\d,]{2,})/i,               // vLLM - grabs the final number after max_model_len
     /maximum context length is\s*([\d,]{2,})/i,   // OpenAI
     /context (?:length|size|window)\D*([\d,]{2,})/i,
     /n_ctx\s*=\s*([\d,]{2,})/i,                    // llama.cpp

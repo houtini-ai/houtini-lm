@@ -94,7 +94,7 @@ To check everything's wired up, ask Claude to run houtini-lm's `discover` tool. 
 
 No two open source LLMs are the same. They differ in context window, output cap, prompt template, whether they think before they answer and how much of that they report, so a lot of houtini-lm's code is about working out what it's talking to and adjusting for it. [How houtini-lm handles different models](./manual/models.md) has the full detail, and here's the short version.
 
-At startup houtini-lm asks your server for every model it has, loaded and downloaded, and looks each one up on HuggingFace for its architecture, licence and chat template, caching the lot in SQLite so later startups are instant. For the families I know well (Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS, DeepSeek, Gemma, Kimi and the hosted GPT-5/6 models) there's a curated profile, and each family gets its own temperature, output constraints and think-block handling. Run `list_models` and you get the whole picture:
+At startup houtini-lm asks your server for every model it has, loaded and downloaded, and looks each one up on HuggingFace for its architecture, licence and chat template, caching the lot in SQLite so later startups are instant. For the families I know well (Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS, DeepSeek, Gemma, Kimi and OpenAI's hosted GPT models) there's a curated profile, and each family gets its own temperature, output constraints and think-block handling, while OpenAI's hosted reasoning models (GPT-5/6, o-series) are sent only the parameters they accept. Run `list_models` and you get the whole picture:
 
 ```
 Loaded models (ready to use):
@@ -195,8 +195,8 @@ Every response ends with a footer computed from the SSE stream itself:
 ```
 ---
 Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
-📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token — use this to gauge whether to delegate longer tasks.
-💰 Claude quota saved — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
+📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token - use this to gauge whether to delegate longer tasks.
+💰 Claude quota saved - this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
 ```
 
 The first-call line appears once per model per session, and it's a benchmark from a real task rather than a synthetic warm-up. The savings line updates every call. When a model reports its reasoning tokens, the token count splits into reasoning and visible, so you can see when a thinking model is burning budget on hidden reasoning.

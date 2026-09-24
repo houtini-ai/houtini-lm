@@ -77,7 +77,7 @@ Every inference response ends with a footer. It's worth learning to read:
 
 ```
 Model: qwen3.6-27b | 353→2829 tokens | TTFT: 126ms, 18.8 tok/s, 150.3s | typescript · 1 file(s) read
-💰 Claude quota saved — this session: 3,809 tokens / 2 calls · lifetime: 150,158 tokens / 197 calls
+💰 Claude quota saved - this session: 3,809 tokens / 2 calls · lifetime: 150,158 tokens / 197 calls
 ```
 
 - `353→2829` - prompt tokens in, completion tokens out. If the output number dwarfs the visible text, the difference went on hidden reasoning.

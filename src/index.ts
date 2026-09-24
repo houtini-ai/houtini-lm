@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Houtini LM — MCP Server for Local LLMs via OpenAI-compatible API
+ * Houtini LM - MCP Server for Local LLMs via OpenAI-compatible API
  *
  * Connects to LM Studio (or any OpenAI-compatible endpoint) and exposes
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
@@ -43,6 +43,8 @@ import {
   capOutputBudget,
   inflateForThinking,
   resolveThinkingOverride,
+  isOpenAIReasoningModel,
+  applyReasoningModelPolicy,
   isConfidentPrefillEstimate,
   extractSamplingParams,
   validTemperature,
@@ -78,24 +80,24 @@ const LM_PASSWORD =
   process.env.OPENROUTER_API_KEY ||
   '';
 const HOUTINI_LM_PROVIDER = (process.env.HOUTINI_LM_PROVIDER || '').toLowerCase();
-const DEFAULT_MAX_TOKENS = 16384;             // fallback when model context is unknown — overridden by dynamic calculation below
+const DEFAULT_MAX_TOKENS = 16384;             // fallback when model context is unknown - overridden by dynamic calculation below
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
-const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications reset MCP client timeout, so this is a safety net not the primary limit
+const SOFT_TIMEOUT_MS = 300_000;             // 5 min - progress notifications reset MCP client timeout, so this is a safety net not the primary limit
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
-const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
+const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk - prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
 const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
 const DISCOVER_MODEL_LIMIT = 12;             // discover is meant to be cheap; list_models shows the full catalogue
 const LIST_MODELS_DETAIL_LIMIT = 30;         // above this, list_models switches to one line per model
-const STREAM_PROGRESS_THROTTLE_MS = 500;     // min gap between per-delta streaming progress pings — decoupled from token rate so a fast model can't flood stdio
+const STREAM_PROGRESS_THROTTLE_MS = 500;     // min gap between per-delta streaming progress pings - decoupled from token rate so a fast model can't flood stdio
 const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
   10,
 );
 
 // ── code_task_files read guards ──────────────────────────────────────
-// Per-file size cap (default 10 MB) — files are read fully into memory before
+// Per-file size cap (default 10 MB) - files are read fully into memory before
 // the token estimator runs, so an unbounded read risks memory exhaustion.
 const MAX_FILE_BYTES = Math.max(1, parseInt(process.env.HOUTINI_LM_MAX_FILE_MB || '10', 10)) * 1024 * 1024;
 // Optional allowlist of directory roots that code_task_files may read from.
@@ -103,7 +105,7 @@ const MAX_FILE_BYTES = Math.max(1, parseInt(process.env.HOUTINI_LM_MAX_FILE_MB |
 // comma-separated), reads are confined to these roots AFTER symlink resolution,
 // so a prompt-injected call can't escape to ~/.ssh/id_rsa via a planted symlink.
 // Roots are realpath'd (not just resolved) so they compare correctly against the
-// realpath'd file below — otherwise a root under a symlinked ancestor (e.g. macOS
+// realpath'd file below - otherwise a root under a symlinked ancestor (e.g. macOS
 // /tmp → /private/tmp) would never match and every confined read would fail. A
 // non-existent root falls back to resolve(), which simply won't match anything.
 const FILE_ROOTS: string[] = (process.env.HOUTINI_LM_FILE_ROOTS || '')
@@ -145,7 +147,7 @@ const session = {
   modelStats: new Map<string, { calls: number; ttftCalls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number }>(),
 };
 
-// Lifetime mirror — kept in sync with the SQLite `model_performance` table
+// Lifetime mirror - kept in sync with the SQLite `model_performance` table
 // so the footer/discover path stays synchronous. Hydrated once at startup
 // from `getAllPerformance()`, then updated in-memory alongside every DB
 // write in `recordUsage`. Also updated after the async DB write completes
@@ -155,7 +157,7 @@ const lifetime = {
   totalTokens: 0,
   modelsUsed: 0,
   firstSeenAt: null as number | null,
-  /** Per-model lifetime stats — same shape as session.modelStats for easy formatting. */
+  /** Per-model lifetime stats - same shape as session.modelStats for easy formatting. */
   modelStats: new Map<string, { calls: number; ttftCalls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number; totalPromptTokens: number; firstSeenAt: number; lastUsedAt: number }>(),
 };
 
@@ -197,7 +199,7 @@ async function hydrateLifetimeFromDb(): Promise<void> {
  *
  * Known limitation (tracked separately): for thinking models TTFT is time to
  * first *visible* token, so reasoning time is excluded from the denominator
- * while reasoning tokens remain in completion_tokens — resolving that needs the
+ * while reasoning tokens remain in completion_tokens - resolving that needs the
  * TTFT-vs-reasoning fix, out of scope for this change.
  */
 function computeTokPerSec(resp: StreamingResult): number | null {
@@ -240,7 +242,7 @@ function recordUsage(resp: StreamingResult) {
     session.modelStats.set(resp.model, existing);
   }
 
-  // Lifetime mirror + SQLite write — fire-and-forget so a DB hiccup can't
+  // Lifetime mirror + SQLite write - fire-and-forget so a DB hiccup can't
   // stall a tool response. The in-memory mirror is updated synchronously so
   // the footer and discover output reflect this call immediately.
   if (resp.model && (promptTokens > 0 || completionTokens > 0)) {
@@ -300,10 +302,10 @@ function sessionSummary(): string {
     ? `this session: ${total.toLocaleString()} tokens / ${session.calls} ${callWord(session.calls)}`
     : 'this session: 0 tokens';
 
-  // Lifetime numbers only show once there's something in the DB — avoids a
+  // Lifetime numbers only show once there's something in the DB - avoids a
   // confusing "lifetime: 0" on a truly fresh install.
   if (lifetime.totalCalls > 0) {
-    return `💰 Claude quota saved — ${sessionPart} · lifetime: ${lifetime.totalTokens.toLocaleString()} tokens / ${lifetime.totalCalls} ${callWord(lifetime.totalCalls)}`;
+    return `💰 Claude quota saved - ${sessionPart} · lifetime: ${lifetime.totalTokens.toLocaleString()} tokens / ${lifetime.totalCalls} ${callWord(lifetime.totalCalls)}`;
   }
   return `💰 Claude quota saved ${sessionPart}`;
 }
@@ -335,7 +337,7 @@ function apiHeaders(): Record<string, string> {
 // inference call runs at a time; others wait in line.
 
 // Global override: HOUTINI_LM_SERIALISE=0 (or false/no/off) turns OFF inference
-// serialisation entirely — both the in-process semaphore and the cross-process
+// serialisation entirely - both the in-process semaphore and the cross-process
 // file lock. The right setting for backends that batch requests natively (vLLM,
 // TGI, SGLang), where one-at-a-time only throttles throughput. Default on, which
 // suits a single-model LM Studio / Ollama host contending for one GPU.
@@ -351,7 +353,7 @@ let inferenceLock: Promise<void> = Promise.resolve();
 
 function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
   // Skip when serialisation is off (env override) or the backend is
-  // parallel-friendly (OpenRouter etc.) — serialising there just throttles us.
+  // parallel-friendly (OpenRouter etc.) - serialising there just throttles us.
   if (!shouldSerialiseInference()) return fn();
   let release: () => void;
   const next = new Promise<void>((resolve) => { release = resolve; });
@@ -414,7 +416,7 @@ interface ModelInfo {
   context_length?: number;     // v1 API fallback
   max_model_len?: number;      // vLLM fallback
   owned_by?: string;
-  max_output_tokens?: number;  // declared output cap (LiteLLM /model/info) — budget is clamped to it
+  max_output_tokens?: number;  // declared output cap (LiteLLM /model/info) - budget is clamped to it
   upstream_model?: string;     // behind a router: the real model an alias resolves to, provider stripped
   router_mode?: string | null; // LiteLLM mode ('chat', 'responses', ...); null = unknown, typically self-hosted
   [key: string]: unknown;
@@ -431,7 +433,7 @@ interface ModelProfile {
   strengths: string[];
   weaknesses: string[];
   bestFor: string[];
-  size?: string; // e.g. "3B", "70B" — only if consistently one size
+  size?: string; // e.g. "3B", "70B" - only if consistently one size
 }
 
 const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
@@ -556,10 +558,12 @@ const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
     },
   },
   {
-    pattern: /\bgpt-[56](?:[.-]|$)/i,
+    // Hosted OpenAI models: GPT-3.5 to GPT-6 and the o-series. gpt-oss (the
+    // open-weight family) has its own profile and isn't matched here.
+    pattern: /(?:^|[\/\s])(?:gpt-(?:3\.5|4o|4\.1|4|5|6)|o[1-9])(?:[.\-]|$)/i,
     profile: {
       family: 'OpenAI GPT (hosted)',
-      description: 'OpenAI\'s hosted GPT-5/GPT-6 family, reached through an API or a router. Frontier-class and fast, but every token is billed - delegation here trades Claude quota for OpenAI spend rather than for local compute.',
+      description: 'OpenAI\'s hosted GPT models (GPT-4 to GPT-6, and the o-series reasoners), reached through an API or a router. Fast and capable, but every token is billed - delegation here trades Claude quota for OpenAI spend rather than for local compute.',
       strengths: ['general reasoning', 'code', 'instruction following', 'long context'],
       weaknesses: ['billed per token', 'reasoning variants spend budget on hidden reasoning'],
       bestFor: ['general delegation', 'code tasks', 'offloading when the local GPU is busy'],
@@ -569,7 +573,7 @@ const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
     pattern: /nomic.*embed|embed.*nomic/i,
     profile: {
       family: 'Nomic Embed',
-      description: 'Text embedding model for semantic search and similarity. Not a chat model — produces vector embeddings.',
+      description: 'Text embedding model for semantic search and similarity. Not a chat model - produces vector embeddings.',
       strengths: ['text embeddings', 'semantic search', 'clustering'],
       weaknesses: ['cannot chat or generate text'],
       bestFor: ['RAG pipelines', 'semantic similarity', 'document search'],
@@ -618,10 +622,16 @@ async function getModelProfileAsync(model: ModelInfo): Promise<ModelProfile | un
     const cached = await getCachedProfile(model.id);
     if (cached) {
       const profile = cachedToProfile(cached);
+      // A pre-3.3 cache (or a volume carried across upgrades) can hold an
+      // inferred profile written before router aliases were resolved, which
+      // calls a hosted model "local". The alias's upstream is the fact we have.
+      if (profile && model.upstream_model && cached.source === 'inferred' && !cached.hfId) {
+        return { ...profile, description: `Router alias for ${model.upstream_model}. No HuggingFace card found.` };
+      }
       if (profile) return profile;
     }
   } catch {
-    // Cache lookup failed — fall through
+    // Cache lookup failed - fall through
   }
 
   return undefined;
@@ -670,7 +680,7 @@ async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false
   // Profile info (static or auto-generated from SQLite cache)
   if (profile) {
     parts.push(`    ${profile.family}: ${profile.description}`);
-    parts.push(`    Best for: ${profile.bestFor.join(', ')}`);
+    if (profile.bestFor.length) parts.push(`    Best for: ${profile.bestFor.join(', ')}`);
   }
 
   // HuggingFace enrichment line from SQLite cache
@@ -679,7 +689,7 @@ async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false
       const hfLine = await getHFEnrichmentLine(model.id);
       if (hfLine) parts.push(hfLine);
     } catch {
-      // HF enrichment is best-effort — never block on failure
+      // HF enrichment is best-effort - never block on failure
     }
   }
 
@@ -745,7 +755,7 @@ async function fetchWithRetry(
     } catch (e) {
       lastErr = e;
       // A timeout abort can mean the server already received the POST and began
-      // a (billed) generation — re-POSTing /v1/chat/completions would duplicate
+      // a (billed) generation - re-POSTing /v1/chat/completions would duplicate
       // it. Only retry errors that indicate the request never reached the
       // server (connection refused/reset); never on our own abort.
       const isAbort = e instanceof Error && e.name === 'AbortError';
@@ -788,7 +798,7 @@ interface InferenceOptions {
 /**
  * Minimum caller-supplied max_tokens the server will honour. Values below this
  * are discarded so the dynamic context-based budget (25% of the model's context
- * window) applies instead — MCP clients habitually pass tiny caps like 256 that
+ * window) applies instead - MCP clients habitually pass tiny caps like 256 that
  * strangle reasoning models. Set HOUTINI_LM_MIN_TOKENS=0 to honour any value
  * (e.g. deliberate micro-chunking on slow hardware), or a different floor.
  */
@@ -801,7 +811,7 @@ const MIN_MAX_TOKENS = (() => {
 function validMaxTokens(v: unknown): number | undefined {
   return validMaxTokensWithFloor(v, MIN_MAX_TOKENS, (n) => {
     process.stderr.write(
-      `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor — ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
+      `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor - ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
     );
   });
 }
@@ -842,6 +852,36 @@ function publishModelList(startedAt: number, models: ModelInfo[]): void {
   if (!modelListCache || startedAt >= modelListCache.at) {
     modelListCache = { at: startedAt, models };
   }
+  profileInBackground(models);
+}
+
+// Profiling runs once per process, on the first model list that has anything
+// in it - not just at boot. If the endpoint was down when the server started
+// (a GPU box still booting, vLLM still loading), the first successful list
+// later in the session profiles the models then, instead of never.
+let profiledOnce = false;
+let profilingInFlight = false;
+
+function profileInBackground(models: ModelInfo[]): void {
+  if (profiledOnce || profilingInFlight || models.length === 0) return;
+  // Behind a router only self-hosted models need profiling - LiteLLM has no
+  // metadata for them. Hosted ones are already described by /model/info, and
+  // profiling each would cost a pointless HuggingFace round trip (a real
+  // router lists 100+).
+  const toProfile = getBackend() === 'litellm'
+    ? models.filter((m) => m.router_mode === null && m.type !== 'embeddings')
+    : models;
+  profilingInFlight = true;
+  profileModelsAtStartup(toProfile.map((m) => ({
+    id: m.id,
+    publisher: m.publisher,
+    arch: m.arch,
+    type: m.type,
+    upstream: m.upstream_model,
+  })))
+    .then(() => { profiledOnce = true; })
+    .catch((err) => process.stderr.write(`[houtini-lm] Model profiling failed, will retry on the next model list: ${err}\n`))
+    .finally(() => { profilingInFlight = false; });
 }
 
 /** Fetch the live list and publish it. Used by discover / list_models / startup. */
@@ -886,7 +926,7 @@ async function chatCompletionStreamingInner(
   messages: ChatMessage[],
   options: InferenceOptions = {},
 ): Promise<StreamingResult> {
-  // Resolve active model once — we use it for both context-aware max_tokens
+  // Resolve active model once - we use it for both context-aware max_tokens
   // and for auto-injecting the model field when the caller didn't specify one.
   // Ollama returns HTTP 400 ("model is required") if the field is absent;
   // LM Studio accepts an empty field and picks the loaded default. Resolving
@@ -929,7 +969,7 @@ async function chatCompletionStreamingInner(
     body.response_format = options.responseFormat;
   }
 
-  // Optional sampling controls — forwarded only when the caller set them (already
+  // Optional sampling controls - forwarded only when the caller set them (already
   // range-validated in extractSamplingParams). Backends ignore unknown fields, so
   // sending e.g. top_k to one that doesn't support it is harmless.
   const s = options.sampling;
@@ -948,18 +988,24 @@ async function chatCompletionStreamingInner(
   // thinking that consumes part of the max_tokens budget for invisible reasoning
   // before producing content. Strategy:
   //   1. reasoning_effort=<family-specific value> to minimise reasoning
-  //   2. enable_thinking:false — Qwen3 vendor param (ignored elsewhere)
-  //   3. inflate max_tokens 4× — safety net when both flags are ignored
+  //   2. enable_thinking:false - Qwen3 vendor param (ignored elsewhere)
+  //   3. inflate max_tokens 4× - safety net when both flags are ignored
   //      (e.g. Gemma 4 hardcodes enable_thinking=true in its Jinja template)
   //
   // IMPORTANT: reasoning_effort values are NOT standard. OpenAI/gpt-oss use
   // 'low'|'medium'|'high'; Ollama adds 'none'; LM Studio's Nemotron adapter
   // only accepts 'on'|'off'. Sending 'low' to Nemotron causes LM Studio to
-  // silently fall back to 'on' — maximising reasoning, the OPPOSITE of intent.
+  // silently fall back to 'on' - maximising reasoning, the OPPOSITE of intent.
   // Hence the family-specific mapping below. When uncertain, we omit the
   // field entirely rather than risk a bad-value fallback.
   const modelId = (resolvedModel || '').toString();
   const profile = getProviderProfile();
+  // OpenAI's hosted reasoning models (GPT-5/6, o-series) manage their own
+  // reasoning and reject max_tokens, sampling controls and the open-weight
+  // thinking toggles, so they skip the toggle path and get a cleaned body
+  // below. Not on OpenRouter, which normalises parameters itself.
+  const hostedReasoning = profile.reasoningStyle !== 'openrouter-field'
+    && (isOpenAIReasoningModel(modelId) || isOpenAIReasoningModel(modelEntry?.upstream_model));
 
   if (profile.reasoningStyle === 'openrouter-field') {
     // OpenRouter exposes reasoning as a separate response field and takes a
@@ -967,7 +1013,7 @@ async function chatCompletionStreamingInner(
     // source. We don't expose a thinking channel to MCP clients, so exclude
     // is the cleanest option. We still inflate max_tokens because some
     // providers bill/count reasoning tokens against the cap before exclude
-    // filtering — and because `exclude` only hides reasoning, it doesn't
+    // filtering - and because `exclude` only hides reasoning, it doesn't
     // guarantee the model generates less of it.
     body.reasoning = { exclude: true };
     const beforeInflation = effectiveMaxTokens;
@@ -975,7 +1021,7 @@ async function chatCompletionStreamingInner(
     body.max_tokens = inflated;
     body.max_completion_tokens = inflated;
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
-  } else if (modelId) {
+  } else if (modelId && !hostedReasoning) {
     // Behind a router the id is an alias ("local") that means nothing to the
     // detector. Check the upstream model it resolves to as well - that's what
     // lets a real thinking model behind an alias get the no-think toggle
@@ -989,7 +1035,7 @@ async function chatCompletionStreamingInner(
     // HF-metadata detection can't see vLLM's arbitrary served-names (e.g. an
     // endpoint that serves "coder-next" instead of the real Qwen3-Coder-Next id),
     // so a genuine thinking model looks non-thinking and the no-think toggle
-    // never fires — the answer then lands in reasoning_content with empty content.
+    // never fires - the answer then lands in reasoning_content with empty content.
     // HOUTINI_LM_THINKING=off forces no-think for every call regardless of
     // detection (correct when an orchestrator does the reasoning and the local
     // model only executes); 'on' forces thinking on; unset/'auto' suppresses
@@ -1016,12 +1062,19 @@ async function chatCompletionStreamingInner(
       // Inflate in both directions: suppression is a request some templates
       // ignore, and forced thinking is exactly when reasoning eats the budget.
       // Uses effectiveMaxTokens (the context-aware value), not
-      // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
+      // DEFAULT_MAX_TOKENS - otherwise big-context models get sized down.
       const beforeInflation = effectiveMaxTokens;
       const inflated = capToContext(inflateForThinking(beforeInflation));
       body.max_tokens = inflated;
       body.max_completion_tokens = inflated;
       process.stderr.write(`[houtini-lm] Thinking model ${modelId}${upstream ? ` (→ ${upstream})` : ''}: ${enableThinking ? 'enable_thinking=true (forced by HOUTINI_LM_THINKING=on)' : `reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false`}, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+    }
+  }
+
+  if (hostedReasoning) {
+    const dropped = applyReasoningModelPolicy(body);
+    if (dropped.length) {
+      process.stderr.write(`[houtini-lm] Hosted reasoning model ${modelId}: sending max_completion_tokens=${body.max_completion_tokens}, omitted ${dropped.join(', ')}\n`);
     }
   }
 
@@ -1031,7 +1084,7 @@ async function chatCompletionStreamingInner(
   // MCP client's request timeout alive during the HTTP handshake with the
   // upstream LLM. On slow backends (big prompt, heavy prefill, cold model)
   // the POST to /v1/chat/completions can sit for 30-60+ seconds before the
-  // response headers flush — that window used to be silent and would trip
+  // response headers flush - that window used to be silent and would trip
   // the client's 60s default timeout before any SSE chunk reached us.
   let progressSeq = 0;
   const sendProgress = (message: string) => {
@@ -1044,7 +1097,7 @@ async function chatCompletionStreamingInner(
         progress: progressSeq,
         message,
       },
-    }).catch(() => { /* best-effort — don't break streaming */ });
+    }).catch(() => { /* best-effort - don't break streaming */ });
   };
 
   // Throttled variant for the per-delta streaming updates. Streaming fires a
@@ -1052,7 +1105,7 @@ async function chatCompletionStreamingInner(
   // 145 tok/s) that would be ~145 JSON-RPC notifications/sec over stdio,
   // flooding the transport and the client's notification handler. Gate those
   // on a time interval so the notification rate is decoupled from the token
-  // rate — slow models still update often, fast models emit at most one ping
+  // rate - slow models still update often, fast models emit at most one ping
   // per interval. The immediate connect ping and the interval keepalives below
   // bypass this deliberately.
   let lastStreamProgressMs = 0;
@@ -1063,7 +1116,7 @@ async function chatCompletionStreamingInner(
     sendProgress(message);
   };
 
-  // Ping once immediately — resets the client's timeout clock as soon as the
+  // Ping once immediately - resets the client's timeout clock as soon as the
   // tool call is acknowledged server-side, regardless of how long prefill or
   // the upstream handshake takes.
   sendProgress('Connecting to model...');
@@ -1078,7 +1131,7 @@ async function chatCompletionStreamingInner(
   const releaseInferenceLock = shouldSerialiseInference()
     ? await acquireInferenceLock({
         onWait: canKeepalive
-          ? (waitedMs) => sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`)
+          ? (waitedMs) => sendProgress(`Waiting for the local model - another request is running (${(waitedMs / 1000).toFixed(0)}s)`)
           : undefined,
         // Without a progressToken we can't keep the client alive during a long
         // wait, so fail open well before the typical ~60s client request timeout
@@ -1089,7 +1142,7 @@ async function chatCompletionStreamingInner(
 
   try {
 
-  // Pre-fetch heartbeat — keep the client alive while we wait for the
+  // Pre-fetch heartbeat - keep the client alive while we wait for the
   // upstream LLM to return response headers. Cleared once fetch resolves.
   const preFetchTimer: ReturnType<typeof setInterval> = setInterval(() => {
     const waitedMs = Date.now() - startTime;
@@ -1117,25 +1170,26 @@ async function chatCompletionStreamingInner(
     // Context-overflow self-heal. A strict backend (vLLM) rejects
     // prompt+max_tokens > context with a 400 instead of clamping. This fires
     // when the context we detected via /v1/models is larger than the model
-    // actually loaded — classically a proxy (LiteLLM router) advertising a
+    // actually loaded - classically a proxy (LiteLLM router) advertising a
     // generic window (e.g. 100k) in front of a 64k model. The server states
     // its real limit in the error; parse it, resize the budget, and retry ONCE.
     if (!res.ok && res.status === 400) {
       const errText = await res.text().catch(() => '');
       const realLimit = parseContextOverflow(errText);
-      const currentMax = Number(body.max_tokens) || 0;
+      const currentMax = Number(body.max_tokens ?? body.max_completion_tokens) || 0;
       const corrected = realLimit
         ? correctedMaxTokens(realLimit, promptChars, messages.length)
         : 0;
       if (realLimit && corrected > 0 && corrected < currentMax) {
         process.stderr.write(
-          `[houtini-lm] Backend context is ${realLimit} tokens (smaller than the ${contextLen ?? 'unknown'} we detected — likely a proxy advertising a generic window). max_tokens ${currentMax} → ${corrected}; retrying once.\n`,
+          `[houtini-lm] Backend context is ${realLimit} tokens (smaller than the ${contextLen ?? 'unknown'} we detected - likely a proxy advertising a generic window). max_tokens ${currentMax} → ${corrected}; retrying once.\n`,
         );
-        body.max_tokens = corrected;
+        // Hosted reasoning models had max_tokens stripped - don't re-add it.
+        if ('max_tokens' in body) body.max_tokens = corrected;
         body.max_completion_tokens = corrected;
         res = await issueRequest();
       } else {
-        // Not a recoverable context overflow — surface the original error.
+        // Not a recoverable context overflow - surface the original error.
         throw new Error(`LM Studio API error ${res.status}: ${errText}`);
       }
     }
@@ -1149,7 +1203,7 @@ async function chatCompletionStreamingInner(
   }
 
   if (!res.body) {
-    throw new Error('Response body is null — streaming not supported by endpoint');
+    throw new Error('Response body is null - streaming not supported by endpoint');
   }
 
   const reader = res.body.getReader();
@@ -1165,13 +1219,13 @@ async function chatCompletionStreamingInner(
   let ttftMs: number | undefined;
   let firstChunkReceived = false;
   // Backends (OpenRouter, vLLM, llama.cpp) can emit an error object mid-stream
-  // — `data: {"error":{...}}` — then close the connection normally. Without
+  // - `data: {"error":{...}}` - then close the connection normally. Without
   // capturing it, the loop parses the payload, matches no field, and returns
   // the partial/empty content as a clean success. Track it so we can surface
   // the real cause instead of silently corrupting the result.
   let streamError: string | undefined;
 
-  // Prefill keep-alive — even after HTTP headers flush, the first SSE chunk
+  // Prefill keep-alive - even after HTTP headers flush, the first SSE chunk
   // can still lag while the model finishes prompt processing. Fire a progress
   // notification every 10s until the first chunk arrives.
   const keepAliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
@@ -1225,7 +1279,7 @@ async function chatCompletionStreamingInner(
         try {
           const json = JSON.parse(trimmed.slice(6));
 
-          // Mid-stream error from the backend — capture the cause and stop.
+          // Mid-stream error from the backend - capture the cause and stop.
           // The connection usually closes normally right after, so without
           // this the partial result would be returned as a success.
           const errMsg = extractStreamError(json);
@@ -1245,7 +1299,7 @@ async function chatCompletionStreamingInner(
           //   - Ollama OpenAI-compat (all thinking models)       → delta.reasoning
           // We capture both so runtime detection and safety-net fallback fire
           // regardless of backend. An Ollama qwen3:4b at low max_tokens
-          // previously looked like a broken model — silent empty content —
+          // previously looked like a broken model - silent empty content —
           // because this channel was dropped.
           const reasoningChunk = (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0)
             ? delta.reasoning_content
@@ -1285,7 +1339,7 @@ async function chatCompletionStreamingInner(
       if (streamError) break;
     }
 
-    // Flush remaining buffer — the usage chunk often arrives in the final SSE
+    // Flush remaining buffer - the usage chunk often arrives in the final SSE
     // message and may not have a trailing newline, leaving it stranded in buffer.
     if (buffer.trim()) {
       const trimmed = buffer.trim();
@@ -1316,14 +1370,14 @@ async function chatCompletionStreamingInner(
           if (reason) finishReason = reason;
           if (json.usage) usage = json.usage;
         } catch (e) {
-          // Incomplete JSON in final buffer — log for diagnostics
+          // Incomplete JSON in final buffer - log for diagnostics
           process.stderr.write(`[houtini-lm] Unflushed buffer parse failed (${buffer.length} bytes): ${e}\n`);
         }
       }
     }
   } finally {
     clearInterval(keepAliveTimer);
-    // Best-effort cancel with a short timeout — cancel() can hang if the upstream
+    // Best-effort cancel with a short timeout - cancel() can hang if the upstream
     // connection is wedged, so we race it against a 500ms timer. This frees the
     // underlying socket sooner on abrupt client disconnects without blocking the
     // tool response path.
@@ -1338,7 +1392,7 @@ async function chatCompletionStreamingInner(
 
   const generationMs = Date.now() - startTime;
 
-  // Backend failed mid-stream and produced nothing usable — surface the real
+  // Backend failed mid-stream and produced nothing usable - surface the real
   // cause as an error rather than returning an empty "success" the orchestrator
   // would treat as a valid (empty) answer. When partial content did arrive we
   // keep it but carry streamError through so the footer flags it.
@@ -1349,9 +1403,9 @@ async function chatCompletionStreamingInner(
   // Strip <think>...</think> reasoning blocks from models that always emit them
   // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Claude doesn't
   // need the model's internal reasoning. Handle three shapes:
-  //   1. Balanced  <think>...</think>  — GLM Flash, Nemotron normal case
+  //   1. Balanced  <think>...</think>  - GLM Flash, Nemotron normal case
   //   2. Orphan opener <think>... (truncated)
-  //   3. Orphan closer ...</think>  — Ollama Qwen3 streams reasoning directly
+  //   3. Orphan closer ...</think>  - Ollama Qwen3 streams reasoning directly
   //      on the content channel and terminates with a bare </think> before the
   //      real answer. Strip everything up to and including the first closer.
   let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
@@ -1360,7 +1414,7 @@ async function chatCompletionStreamingInner(
   // </think> before the answer (Ollama Qwen3). Strip up to the first closer ONLY
   // for models KNOWN to emit think blocks (per the cached profile). For any other
   // model, leave it: a real answer that merely quotes "</think>" would otherwise
-  // be truncated — and a leaked reasoning prefix (visible, recoverable) is a far
+  // be truncated - and a leaked reasoning prefix (visible, recoverable) is a far
   // safer failure than deleting answer text (silent, unrecoverable). The earlier
   // backtick heuristic was lose-lose (leaked reasoning containing code, still
   // deleted answers with an unquoted literal); the profile flag is the right signal.
@@ -1377,7 +1431,7 @@ async function chatCompletionStreamingInner(
   // Safety nets for empty visible output. Try in order:
   //   1. thinkStripFallback: stripping <think> left nothing, but raw content had text
   //   2. reasoningFallback: no visible content AT ALL, but reasoning_content was streamed
-  //      (this is the Nemotron/DeepSeek-R1/LM-Studio-dev-toggle case — previously
+  //      (this is the Nemotron/DeepSeek-R1/LM-Studio-dev-toggle case - previously
   //      produced silent empty bodies because reasoning was discarded)
   let thinkStripFallback = false;
   let reasoningFallback = false;
@@ -1388,7 +1442,7 @@ async function chatCompletionStreamingInner(
     } else if (reasoning.trim()) {
       reasoningFallback = true;
       cleanContent =
-        '[No visible output — the model spent its entire output budget on reasoning_content before emitting any content. ' +
+        '[No visible output - the model spent its entire output budget on reasoning_content before emitting any content. ' +
         'Raw reasoning below so you can see what it was doing:]\n\n' +
         reasoning.trim();
     }
@@ -1417,7 +1471,7 @@ async function chatCompletionStreamingInner(
 
 // Backend detection. Probed once on first listModelsRaw() call, cached for
 // the session. We keep inference on the portable /v1/chat/completions path
-// regardless of backend — this flag is for enrichment (richer model metadata,
+// regardless of backend - this flag is for enrichment (richer model metadata,
 // accurate "it's LM Studio, so the dev-toggle for reasoning_content matters"
 // hints in diagnostics, etc.).
 type Backend = 'lmstudio' | 'ollama' | 'openai-compat' | 'openrouter' | 'litellm';
@@ -1428,11 +1482,11 @@ function getBackend(): Backend {
 }
 
 /**
- * Provider profile — per-backend flags that gate behavioural differences
+ * Provider profile - per-backend flags that gate behavioural differences
  * (serialisation, retry, attribution headers, reasoning handling).
  *
  * Keep this minimal. Add flags only when a concrete divergence forces it,
- * not speculatively — today's registry has 2 providers' worth of divergence.
+ * not speculatively - today's registry has 2 providers' worth of divergence.
  */
 interface ProviderProfile {
   /** Send OpenRouter-style attribution headers (HTTP-Referer, X-Title). */
@@ -1508,12 +1562,12 @@ function backendLabel(): string {
 
 /**
  * Fetch models with backend-aware probing.
- *   1. LM Studio /api/v0/models — richest metadata, sets backend='lmstudio'
- *   2. Ollama /api/tags           — native list, sets backend='ollama', maps to ModelInfo
- *   3. OpenAI-compatible /v1/models — generic fallback (DeepSeek, vLLM, llama.cpp, OpenRouter)
+ *   1. LM Studio /api/v0/models - richest metadata, sets backend='lmstudio'
+ *   2. Ollama /api/tags           - native list, sets backend='ollama', maps to ModelInfo
+ *   3. OpenAI-compatible /v1/models - generic fallback (DeepSeek, vLLM, llama.cpp, OpenRouter)
  */
 async function listModelsRaw(): Promise<ModelInfo[]> {
-  // OpenRouter short-circuit — no point probing LM Studio/Ollama-specific
+  // OpenRouter short-circuit - no point probing LM Studio/Ollama-specific
   // endpoints. /v1/models returns richer metadata than our fallback path
   // normally exposes: context_length, architecture.input_modalities, pricing.
   const isOpenRouter =
@@ -1544,7 +1598,7 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
     }));
   }
 
-  // Try LM Studio's v0 API first — returns type, arch, publisher, quantization, state
+  // Try LM Studio's v0 API first - returns type, arch, publisher, quantization, state
   try {
     const v0 = await fetchWithTimeout(
       `${LM_BASE_URL}/api/v0/models`,
@@ -1556,7 +1610,7 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
       return data.data;
     }
   } catch {
-    // v0 not available — fall through
+    // v0 not available - fall through
   }
 
   // Try Ollama's /api/tags next. Shape differs from OpenAI: returns
@@ -1589,7 +1643,7 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
       }
     }
   } catch {
-    // Not Ollama — fall through
+    // Not Ollama - fall through
   }
 
   // Fallback: OpenAI-compatible v1 endpoint (DeepSeek, vLLM, llama.cpp, LiteLLM)
@@ -1704,7 +1758,7 @@ function hasReportedContext(model: ModelInfo): boolean {
  *   - Generic OpenAI-compat: 'low' (OpenAI's minimum, safe to send)
  *
  * An unsupported value is a hard 400 error on LM Studio (not a silent
- * fallback), so this function is conservative — it returns null for
+ * fallback), so this function is conservative - it returns null for
  * unknown backends and we omit the field rather than risk a 400.
  */
 function getReasoningEffortValue(_modelId: string): string | null {
@@ -1714,13 +1768,13 @@ function getReasoningEffortValue(_modelId: string): string | null {
   if (backend === 'lmstudio') return 'none';
   // Ollama likewise documents 'none' as valid.
   if (backend === 'ollama') return 'none';
-  // Generic OpenAI-compatible — 'low' is the minimum OpenAI accepts per spec.
+  // Generic OpenAI-compatible - 'low' is the minimum OpenAI accepts per spec.
   // DeepSeek's own API treats 'low' as minimum too.
   return 'low';
 }
 
 /** Conservative default prefill rate when no per-model measurement exists.
- * Slower than real hardware so we err toward letting the call run — a false
+ * Slower than real hardware so we err toward letting the call run - a false
  * refusal is much worse than a false-ok that eventually times out. */
 const DEFAULT_PREFILL_TOK_PER_SEC = 300;
 
@@ -1728,7 +1782,7 @@ const DEFAULT_PREFILL_TOK_PER_SEC = 300;
  * generation headroom inside the ~60s MCP-client request-timeout budget. */
 const PREFILL_REFUSE_THRESHOLD_SEC = 45;
 
-/** Soft warning threshold — we proceed but log a stderr warning. */
+/** Soft warning threshold - we proceed but log a stderr warning. */
 const PREFILL_WARN_THRESHOLD_SEC = 25;
 
 interface PrefillEstimate {
@@ -1746,7 +1800,7 @@ interface PrefillEstimate {
 
 /**
  * Estimate prompt prefill time. Preferred method is a linear regression
- * `TTFT ≈ α + β·prompt_tokens` over recent per-model samples — this separates
+ * `TTFT ≈ α + β·prompt_tokens` over recent per-model samples - this separates
  * fixed per-request overhead (α) from genuine per-token prefill cost (β) and
  * avoids the under-prediction that a ratio-of-averages estimator produces
  * when the current input is much larger than the historical mean.
@@ -1790,7 +1844,7 @@ async function estimatePrefill(inputChars: number, modelId: string): Promise<Pre
       }
     }
   } catch {
-    // Sample fetch failed — fall through to the conservative default.
+    // Sample fetch failed - fall through to the conservative default.
   }
 
   // 3. Conservative default for unknown model/hardware.
@@ -1817,7 +1871,7 @@ interface RoutingDecision {
 
 async function routeToModel(taskType: TaskType, override?: string): Promise<RoutingDecision> {
   // Explicit override wins over routing. Honoured regardless of whether we
-  // can even list models — useful for remote providers (OpenRouter) where
+  // can even list models - useful for remote providers (OpenRouter) where
   // the user knows the model id and doesn't want routing to second-guess.
   const pinned = override || LM_MODEL;
   if (pinned) {
@@ -1833,7 +1887,7 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
   try {
     models = await listModelsCached();
   } catch {
-    // Can't reach server — fall back to default (empty string; caller handles)
+    // Can't reach server - fall back to default (empty string; caller handles)
     const hints = getPromptHints(LM_MODEL);
     return { modelId: LM_MODEL || '', hints };
   }
@@ -1888,7 +1942,7 @@ async function routeToModel(taskType: TaskType, override?: string): Promise<Rout
         : taskType === 'analysis' ? 'analysis'
         : taskType === 'embedding' ? 'embeddings'
         : 'this kind of task';
-      result.suggestion = `💡 ${better.id} is downloaded and better suited for ${label} — ask the user to load it in LM Studio.`;
+      result.suggestion = `💡 ${better.id} is downloaded and better suited for ${label} - ask the user to load it in LM Studio.`;
     }
   }
 
@@ -1935,16 +1989,16 @@ function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal
 
 function formatQualityLine(quality: QualitySignal): string {
   const flags: string[] = [];
-  if (quality.prefillStall) flags.push('PREFILL-STALL (no tokens received — input may be too large for this model/hardware)');
+  if (quality.prefillStall) flags.push('PREFILL-STALL (no tokens received - input may be too large for this model/hardware)');
   else if (quality.truncated) flags.push('TRUNCATED');
-  if (quality.reasoningFallback) flags.push('reasoning-only (model exhausted output budget before emitting visible content — showing raw reasoning)');
-  else if (quality.thinkStripFallback) flags.push('think-strip-empty (showing raw reasoning — model ignored enable_thinking:false)');
+  if (quality.reasoningFallback) flags.push('reasoning-only (model exhausted output budget before emitting visible content - showing raw reasoning)');
+  else if (quality.thinkStripFallback) flags.push('think-strip-empty (showing raw reasoning - model ignored enable_thinking:false)');
   else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
   if (quality.estimatedTokens) flags.push('tokens-estimated');
   if (quality.finishReason === 'length') flags.push('hit-max-tokens');
-  // content_filter is a REFUSAL, not a truncation — the orchestrator should
+  // content_filter is a REFUSAL, not a truncation - the orchestrator should
   // handle it differently (don't retry with a bigger budget). Surface distinctly.
-  if (quality.finishReason === 'content_filter') flags.push('CONTENT-FILTERED (model refused/blocked — not a length cut)');
+  if (quality.finishReason === 'content_filter') flags.push('CONTENT-FILTERED (model refused/blocked - not a length cut)');
   if (flags.length === 0) return '';
   return `Quality: ${flags.join(', ')}`;
 }
@@ -1965,7 +2019,7 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
   if (resp.usage) {
-    // OpenAI-spec reasoning-tokens split — when present, show it so the user
+    // OpenAI-spec reasoning-tokens split - when present, show it so the user
     // sees how much of the completion budget went to hidden reasoning vs
     // visible output. Diagnoses "empty body + hit-max-tokens" immediately.
     const reasoningTokens = resp.usage.completion_tokens_details?.reasoning_tokens;
@@ -1975,7 +2029,7 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
     } else {
       parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
     }
-    // Prefix-cache (KV reuse) hits — a strong "this delegation was nearly free"
+    // Prefix-cache (KV reuse) hits - a strong "this delegation was nearly free"
     // signal for the orchestrator when it re-sends shared context.
     const cached = resp.usage.prompt_tokens_details?.cached_tokens;
     if (typeof cached === 'number' && cached > 0) {
@@ -1987,7 +2041,7 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
     parts.push(`~${estTokens} tokens (estimated)`);
   }
 
-  // Perf stats — computed from streaming, no proprietary API needed
+  // Perf stats - computed from streaming, no proprietary API needed
   const perfParts: string[] = [];
   if (resp.ttftMs !== undefined) perfParts.push(`TTFT: ${resp.ttftMs}ms`);
   let tokPerSec = 0;
@@ -2001,26 +2055,26 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
 
   if (extra) parts.push(extra);
 
-  // Quality signals — structured metadata for orchestrator trust decisions
+  // Quality signals - structured metadata for orchestrator trust decisions
   const quality = assessQuality(resp, resp.rawContent);
   const qualityLine = formatQualityLine(quality);
   if (qualityLine) parts.push(qualityLine);
-  if (resp.streamError) parts.push(`⚠ UPSTREAM ERROR (partial result — backend reported: ${resp.streamError})`);
-  else if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
+  if (resp.streamError) parts.push(`⚠ UPSTREAM ERROR (partial result - backend reported: ${resp.streamError})`);
+  else if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout - partial result)');
 
   const benchmarkLine = isFirstBenchmarkedCall(resp.model, tokPerSec)
-    ? `📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : ''} — use this to gauge whether to delegate longer tasks.`
+    ? `📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : ''} - use this to gauge whether to delegate longer tasks.`
     : '';
   const sessionLine = sessionSummary();
 
   if (parts.length === 0 && !benchmarkLine && !sessionLine) return '';
 
   const lines: string[] = [`\n\n---${parts.length > 0 ? `\n${parts.join(' | ')}` : ''}`];
-  // First-call speed benchmark — surfaced once per model per session, based on
+  // First-call speed benchmark - surfaced once per model per session, based on
   // the real task just completed (not a synthetic warmup). Gives Claude honest
   // speed data to calibrate future delegation decisions.
   if (benchmarkLine) lines.push(benchmarkLine);
-  // Session savings — on its own line so it reads as value, not as accounting.
+  // Session savings - on its own line so it reads as value, not as accounting.
   if (sessionLine) lines.push(sessionLine);
 
   return lines.join('\n');
@@ -2076,8 +2130,8 @@ function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>)
 // Optional sampling controls shared by the inference tools. Out-of-range values
 // are dropped server-side (extractSamplingParams), so the backend default applies.
 const SAMPLING_PROPS = {
-  seed: { type: 'integer', description: 'Deterministic sampling seed — same seed + same prompt → reproducible output. Useful for testing.' },
-  stop: { type: ['string', 'array'], items: { type: 'string' }, description: 'Stop sequence(s) — generation halts when one is produced (up to 4).' },
+  seed: { type: 'integer', description: 'Deterministic sampling seed - same seed + same prompt → reproducible output. Useful for testing.' },
+  stop: { type: ['string', 'array'], items: { type: 'string' }, description: 'Stop sequence(s) - generation halts when one is produced (up to 4).' },
   top_p: { type: 'number', description: 'Nucleus sampling 0–1 (e.g. 0.9). Lower = more focused. Alternative to temperature.' },
   top_k: { type: 'integer', description: 'Sample only from the top-K tokens (e.g. 40). 0/omitted = disabled.' },
   repeat_penalty: { type: 'number', description: 'Penalise repetition, 0–2 (1 = off, ~1.1 typical).' },
@@ -2089,7 +2143,7 @@ const TOOLS = [
   {
     name: 'chat',
     description:
-      'Send a task to a local LLM — a sidekick running on the user\'s hardware or a configured OpenAI-compatible endpoint. ' +
+      'Send a task to a local LLM - a sidekick running on the user\'s hardware or a configured OpenAI-compatible endpoint. ' +
       'It does not consume the user\'s Claude quota. Trades latency for tokens: local inference is typically 3-30× slower than frontier models, so delegation wins when the task is bounded and self-contained.\n\n' +
       'Good fit:\n' +
       '• Explain or summarise code/docs you already have in context\n' +
@@ -2100,18 +2154,18 @@ const TOOLS = [
       '• Brainstorm approaches before committing to one\n\n' +
       'Less good when: the task needs tool access, depends on multi-file context you have not captured, or is quick enough for you to answer directly before the round-trip completes.\n\n' +
       'Prompt tips (local models take instructions literally):\n' +
-      '(1) Send COMPLETE context — the local LLM cannot read files.\n' +
+      '(1) Send COMPLETE context - the local LLM cannot read files.\n' +
       '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
-      '(3) Specific system persona beats generic — "Senior TypeScript dev" not "helpful assistant".\n' +
-      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n' +
-      '(5) Leave max_tokens UNSET — the server sizes the budget from the model\'s real context window. Tiny caps like 256 waste the model: reasoning burns the budget before any visible output.\n\n' +
+      '(3) Specific system persona beats generic - "Senior TypeScript dev" not "helpful assistant".\n' +
+      '(4) State constraints - "no preamble", "reference line numbers", "max 5 bullets".\n' +
+      '(5) Leave max_tokens UNSET - the server sizes the budget from the model\'s real context window. Tiny caps like 256 waste the model: reasoning burns the budget before any visible output.\n\n' +
       'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens kept in the user\'s quota.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         message: {
           type: 'string',
-          description: 'The task. Be specific about expected output format. Include COMPLETE code/context — never truncate.',
+          description: 'The task. Be specific about expected output format. Include COMPLETE code/context - never truncate.',
         },
         system: {
           type: 'string',
@@ -2123,7 +2177,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. Small caps like 256/512/1024 strangle reasoning models (hidden thinking burns the budget before visible output), so values below 4,096 are IGNORED and the dynamic budget applies. Only set this to raise the ceiling for very long outputs.',
+          description: 'Response token budget. OMIT THIS - when omitted the server checks the live model\'s context window and allocates 25% of it (e.g. ~32,000 tokens on a 128k-context model), which is right for almost every call. Small caps like 256/512/1024 strangle reasoning models (hidden thinking burns the budget before visible output), so values below 4,096 are IGNORED and the dynamic budget applies. Only set this to raise the ceiling for very long outputs.',
         },
         json_schema: {
           type: 'object',
@@ -2142,18 +2196,18 @@ const TOOLS = [
     name: 'custom_prompt',
     description:
       'Structured analysis via the local LLM with explicit system/context/instruction separation. ' +
-      'The 3-part format prevents context bleed in smaller models — the local LLM acknowledges the context in a fake assistant turn before receiving the instruction.\n\n' +
+      'The 3-part format prevents context bleed in smaller models - the local LLM acknowledges the context in a fake assistant turn before receiving the instruction.\n\n' +
       'Good fit when prompt structure matters:\n' +
-      '• Code review — paste full source, ask for bugs/improvements\n' +
-      '• Comparison — paste two implementations, ask which is better and why\n' +
-      '• Refactoring suggestions — paste code, ask for a cleaner version\n' +
-      '• Content analysis — paste text, ask for structure/tone/issues\n' +
+      '• Code review - paste full source, ask for bugs/improvements\n' +
+      '• Comparison - paste two implementations, ask which is better and why\n' +
+      '• Refactoring suggestions - paste code, ask for a cleaner version\n' +
+      '• Content analysis - paste text, ask for structure/tone/issues\n' +
       '• Any task where separating context from instruction improves clarity\n\n' +
-      'Field guidance (each has a job — keep them focused):\n' +
+      'Field guidance (each has a job - keep them focused):\n' +
       '• system: persona + constraints, under 30 words. "Expert Python developer focused on performance and correctness."\n' +
-      '• context: COMPLETE data — full source, full logs, full text. Never truncate.\n' +
+      '• context: COMPLETE data - full source, full logs, full text. Never truncate.\n' +
       '• instruction: exactly what to produce, under 50 words. Specify format: "Return a JSON array of {line, issue, fix}."\n\n' +
-      'Review the output before acting on it — local model capability varies.',
+      'Review the output before acting on it - local model capability varies.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2175,7 +2229,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
+          description: 'Response token budget. OMIT THIS - the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         json_schema: {
           type: 'object',
@@ -2201,10 +2255,10 @@ const TOOLS = [
       '• Add error handling, logging, or validation\n' +
       '• Convert between languages or patterns\n\n' +
       'For best results:\n' +
-      '• Provide COMPLETE source — the local LLM cannot read files.\n' +
+      '• Provide COMPLETE source - the local LLM cannot read files.\n' +
       '• Include imports and type definitions so the model has full context.\n' +
       '• Be specific: "Write 3 Jest tests for the error paths in fetchUser" beats "Write tests".\n' +
-      '• Set the language field — it shapes the system prompt and improves accuracy.\n\n' +
+      '• Set the language field - it shapes the system prompt and improves accuracy.\n\n' +
       'Verify generated code compiles, handles edge cases, and follows project conventions before committing.',
     inputSchema: {
       type: 'object' as const,
@@ -2223,7 +2277,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
+          description: 'Response token budget. OMIT THIS - the server sizes it from the live model\'s context window (25%, e.g. ~32,000 on a 128k-context model). Values below 4,096 are IGNORED (tiny caps strangle reasoning models) and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
@@ -2237,10 +2291,10 @@ const TOOLS = [
   {
     name: 'code_task_files',
     description:
-      'Like code_task, but the local LLM reads files directly from disk — source never passes through the MCP client\'s context window. Use when reviewing multiple files or a single large file.\n\n' +
+      'Like code_task, but the local LLM reads files directly from disk - source never passes through the MCP client\'s context window. Use when reviewing multiple files or a single large file.\n\n' +
       'How it works:\n' +
       '• Provide absolute paths. Relative paths are rejected.\n' +
-      '• Files are read in parallel (Promise.allSettled) — one unreadable file does not sink the call.\n' +
+      '• Files are read in parallel (Promise.allSettled) - one unreadable file does not sink the call.\n' +
       '• Files are concatenated with `=== filename ===` headers and sent to the same code-review pipeline as code_task.\n' +
       '• Read failures are surfaced inline with the reason so the LLM can still reason about the rest.\n' +
       '• Pre-flight prefill estimate: if measured per-model data shows the input would exceed the MCP client\'s ~60s request timeout during prompt processing, the call is refused early with a diagnostic instead of hanging. Split or trim when this fires.\n\n' +
@@ -2248,15 +2302,15 @@ const TOOLS = [
       '• Reviewing related files together (module + its tests, client + server pair)\n' +
       '• Auditing a single large file too big to paste comfortably\n' +
       '• Any code_task where keeping source out of the Claude context window matters\n\n' +
-      'Size guidance: on slow hardware (< 25 tok/s generation), keep total input under ~8,000 tokens (~32,000 chars) to stay safely under the client timeout. Faster hardware handles much more — the pre-flight estimator adapts once you\'ve done a few calls and real per-model timings are in the SQLite cache.\n\n' +
-      'Same review discipline as code_task — verify the output before acting on it.',
+      'Size guidance: on slow hardware (< 25 tok/s generation), keep total input under ~8,000 tokens (~32,000 chars) to stay safely under the client timeout. Faster hardware handles much more - the pre-flight estimator adapts once you\'ve done a few calls and real per-model timings are in the SQLite cache.\n\n' +
+      'Same review discipline as code_task - verify the output before acting on it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         paths: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute file paths to analyse. Relative paths are rejected — always pass absolute.',
+          description: 'Absolute file paths to analyse. Relative paths are rejected - always pass absolute.',
         },
         task: {
           type: 'string',
@@ -2268,7 +2322,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Response token budget. OMIT THIS — the server sizes it from the live model\'s context window (25%). Values below 4,096 are IGNORED and the dynamic budget applies. Only set to raise the ceiling.',
+          description: 'Response token budget. OMIT THIS - the server sizes it from the live model\'s context window (25%). Values below 4,096 are IGNORED and the dynamic budget applies. Only set to raise the ceiling.',
         },
         model: {
           type: 'string',
@@ -2285,13 +2339,13 @@ const TOOLS = [
       'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
       'response latency, and cumulative session stats (tokens offloaded so far). ' +
       'Call this if you are unsure whether the local LLM is available before delegating work. ' +
-      'Fast — typically responds in under 1 second, or returns an offline status within 5 seconds if the host is unreachable.',
+      'Fast - typically responds in under 1 second, or returns an offline status within 5 seconds if the host is unreachable.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'list_models',
     description:
-      'List all models on the local LLM server — both loaded (ready) and available (downloaded but not active). ' +
+      'List all models on the local LLM server - both loaded (ready) and available (downloaded but not active). ' +
       'Shows rich metadata for each model: type (llm/vlm/embeddings), architecture, quantization, context window, ' +
       'and a capability profile describing what the model is best at. ' +
       'Use this to understand which models are available and suggest switching when a different model would suit the task better.',
@@ -2321,9 +2375,9 @@ const TOOLS = [
   {
     name: 'stats',
     description:
-      'Show user stats: tokens offloaded, calls made, per-model performance — for the current session AND ' +
+      'Show user stats: tokens offloaded, calls made, per-model performance - for the current session AND ' +
       'lifetime (persisted in SQLite at ~/.houtini-lm/model-cache.db). Unlike `discover` which includes the ' +
-      'model catalog, `stats` returns just the numbers in a compact markdown table — cheap to call repeatedly ' +
+      'model catalog, `stats` returns just the numbers in a compact markdown table - cheap to call repeatedly ' +
       'to see the 💰 Claude-quota savings counter climb. Useful for quantifying how much work the local model ' +
       'is genuinely doing, and for noticing when a model\'s reasoning-token ratio is drifting.',
     inputSchema: {
@@ -2345,9 +2399,9 @@ const TOOLS = [
 // rather than relying on per-tool descriptions being re-read on every call.
 const SIDEKICK_INSTRUCTIONS =
   `Houtini-lm is a local LLM sidekick. It runs on the user's hardware (or a configured OpenAI-compatible endpoint) and handles bounded work without consuming the user's Claude quota.\n\n` +
-  `When to reach for it: bounded, self-contained tasks you can describe in one message — explanations, boilerplate, test stubs, code review of pasted or file-loaded source, translations, commit messages, format conversion, brainstorming. Trades wall-clock time for tokens (typically 3-30× slower than frontier models).\n\n` +
+  `When to reach for it: bounded, self-contained tasks you can describe in one message - explanations, boilerplate, test stubs, code review of pasted or file-loaded source, translations, commit messages, format conversion, brainstorming. Trades wall-clock time for tokens (typically 3-30× slower than frontier models).\n\n` +
   `When not to: tasks that need tool access, cross-file reasoning you haven't captured, or work fast enough to answer directly before the delegation round-trip completes.\n\n` +
-  `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
+  `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and - after the first real call - its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
   { name: 'houtini-lm', version: SERVER_VERSION },
@@ -2409,7 +2463,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params;
-  // `arguments` is optional in the MCP CallTool schema — a client may omit it
+  // `arguments` is optional in the MCP CallTool schema - a client may omit it
   // entirely for a param-less tool (e.g. `stats` with no filter). Default to an
   // empty object so handlers that destructure args never throw on `undefined`.
   const args = request.params.arguments ?? {};
@@ -2436,7 +2490,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           role: 'system',
           content: buildSystemPrompt({
             base: system && system.trim() ? system.trim() : 'You are a precise technical assistant.',
-            formatLine: 'Be direct — no preamble, no restating the question. Use markdown formatting where it helps.',
+            formatLine: 'Be direct - no preamble, no restating the question. Use markdown formatting where it helps.',
             modelConstraint: route.hints.outputConstraint,
             structuredOutput: !!responseFormat,
           }),
@@ -2480,7 +2534,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           role: 'system',
           content: buildSystemPrompt({
             base: system && system.trim() ? system.trim() : 'You are a precise technical assistant.',
-            formatLine: 'Be direct — no preamble, no restating the question. Use markdown formatting where it helps.',
+            formatLine: 'Be direct - no preamble, no restating the question. Use markdown formatting where it helps.',
             modelConstraint: route.hints.outputConstraint,
             structuredOutput: !!responseFormat,
           }),
@@ -2531,7 +2585,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             role: 'system',
             content: buildSystemPrompt({
               base: `You are a senior ${lang} developer. Your task: ${task}`,
-              formatLine: 'Be specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.',
+              formatLine: 'Be specific - reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.',
               modelConstraint: route.hints.outputConstraint,
             }),
           },
@@ -2545,7 +2599,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           temperature: route.hints.codeTemp,
           // Pass the (validated) value, undefined when omitted, so the
           // 25%-of-context auto-derivation in chatCompletionStreamingInner fires
-          // — matching code_task_files. Forcing DEFAULT_MAX_TOKENS here made
+          // - matching code_task_files. Forcing DEFAULT_MAX_TOKENS here made
           // options.maxTokens always truthy, capping long generations at 16K.
           maxTokens: validMaxTokens(codeMaxTokens),
           model: route.modelId,
@@ -2578,7 +2632,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Reject relative paths early — silent resolution against cwd is surprising.
+        // Reject relative paths early - silent resolution against cwd is surprising.
         const relative = paths.filter((p) => typeof p !== 'string' || !isAbsolute(p));
         if (relative.length > 0) {
           return {
@@ -2603,7 +2657,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sections.push(`=== ${basename(p)} (${p}) ===\n${r.value.content}`);
           } else {
             const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
-            sections.push(`=== ${basename(p)} (${p}) — READ FAILED ===\n[Could not read: ${reason}]`);
+            sections.push(`=== ${basename(p)} (${p}) - READ FAILED ===\n[Could not read: ${reason}]`);
           }
         });
 
@@ -2632,7 +2686,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // avoids the under-prediction a ratio-of-averages produces on inputs
         // much larger than the historical mean.
         const estimate = await estimatePrefill(combined.length, route.modelId);
-        // A poor fit (low R² — e.g. bimodal samples straddling a backend
+        // A poor fit (low R² - e.g. bimodal samples straddling a backend
         // restart with different perf settings) must not refuse the call: a
         // false refusal is worse than a false-ok that the prefill keepalive
         // and timeout machinery already handle.
@@ -2642,8 +2696,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'
-            ? `• Estimator: linear fit — TTFT ≈ ${Math.round(estimate.fit!.alphaMs)}ms + ${estimate.fit!.betaMsPerToken.toFixed(2)}ms/token (n=${estimate.fit!.n}, R²=${estimate.fit!.r2.toFixed(2)})`
-            : `• Estimator: ratio fallback — ~${Math.round(estimate.prefillTokPerSec!)} tok/s (from ${lifetime.modelStats.get(route.modelId)?.ttftCalls ?? 0} prior calls; less accurate for inputs far from the historical mean)`;
+            ? `• Estimator: linear fit - TTFT ≈ ${Math.round(estimate.fit!.alphaMs)}ms + ${estimate.fit!.betaMsPerToken.toFixed(2)}ms/token (n=${estimate.fit!.n}, R²=${estimate.fit!.r2.toFixed(2)})`
+            : `• Estimator: ratio fallback - ~${Math.round(estimate.prefillTokPerSec!)} tok/s (from ${lifetime.modelStats.get(route.modelId)?.ttftCalls ?? 0} prior calls; less accurate for inputs far from the historical mean)`;
           return {
             content: [{
               type: 'text',
@@ -2672,7 +2726,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             role: 'system',
             content: buildSystemPrompt({
               base: `You are a senior ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output.`,
-              formatLine: 'Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.',
+              formatLine: 'Be specific - line numbers, function names, concrete fixes. Output your analysis as a markdown list.',
               modelConstraint: route.hints.outputConstraint,
             }),
           },
@@ -2744,7 +2798,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // active). `loaded` still includes state-less models from backends that
         // don't report load state, so this fires only when every model is
         // genuinely not-loaded. Report it distinctly instead of presenting an
-        // unloaded model as active — delegating to it would trigger an on-demand
+        // unloaded model as active - delegating to it would trigger an on-demand
         // load on the first call and likely blow the client's request timeout.
         if (loaded.length === 0) {
           const names = (available.length > 0 ? available : models).map((m) => m.id).join(', ');
@@ -2769,10 +2823,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const summary = sessionSummary();
         const sessionStats = session.calls > 0 || lifetime.totalCalls > 0
           ? `\n${summary}`
-          : `\n💰 Claude quota saved this session: 0 tokens — no calls yet. Measured speed for each model will appear here after the first real call.`;
+          : `\n💰 Claude quota saved this session: 0 tokens - no calls yet. Measured speed for each model will appear here after the first real call.`;
 
         // Measured speed line for the active model. Discover intentionally does
-        // not run a synthetic warmup — speed is captured from real tasks, so the
+        // not run a synthetic warmup - speed is captured from real tasks, so the
         // numbers reflect actual workload rather than a contrived benchmark.
         // Shows session stats when this session has measured calls; otherwise
         // falls back to workstation lifetime stats so Claude sees historical
@@ -2794,7 +2848,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const lAvgTokSec = (primaryLifetime.totalTokPerSec / primaryLifetime.perfCalls).toFixed(1);
           speedLine = `Measured speed (lifetime on this workstation): ${lAvgTokSec} tok/s · TTFT ${lAvgTtft}ms (${primaryLifetime.perfCalls} calls, last used ${new Date(primaryLifetime.lastUsedAt).toISOString().slice(0, 10)})\n`;
         } else {
-          speedLine = `Measured speed: not yet benchmarked — will be captured on the first real call.\n`;
+          speedLine = `Measured speed: not yet benchmarked - will be captured on the first real call.\n`;
         }
 
         const ctxLine = hasReportedContext(primary)
@@ -2824,8 +2878,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (primaryProfile) {
           text += `Family: ${primaryProfile.family}\n`;
           text += `Description: ${primaryProfile.description}\n`;
-          text += `Best for: ${primaryProfile.bestFor.join(', ')}\n`;
-          text += `Strengths: ${primaryProfile.strengths.join(', ')}\n`;
+          if (primaryProfile.bestFor.length > 0) text += `Best for: ${primaryProfile.bestFor.join(', ')}\n`;
+          if (primaryProfile.strengths.length > 0) text += `Strengths: ${primaryProfile.strengths.join(', ')}\n`;
           if (primaryProfile.weaknesses.length > 0) {
             text += `Weaknesses: ${primaryProfile.weaknesses.join(', ')}\n`;
           }
@@ -2844,7 +2898,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (available.length > 0) {
           const shown = available.slice(0, DISCOVER_MODEL_LIMIT);
-          text += `\n\nAvailable models (○ downloaded, not loaded — can be activated in LM Studio):\n`;
+          text += `\n\nAvailable models (○ downloaded, not loaded - can be activated in LM Studio):\n`;
           text += (await Promise.all(shown.map((m) => formatModelDetail(m)))).join('\n\n');
           if (available.length > shown.length) {
             text += `\n\n  …and ${available.length - shown.length} more. Run list_models for the full catalogue.`;
@@ -2861,7 +2915,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Workstation lifetime stats — built from SQLite, persists across restarts.
+        // Workstation lifetime stats - built from SQLite, persists across restarts.
         // Only shown when there's lifetime data beyond this session, so a first-run
         // user doesn't see a duplicate of the session block above.
         const hasLifetimeBeyondSession = Array.from(lifetime.modelStats.entries())
@@ -2951,7 +3005,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           // Round to 7 significant figures for transport. Embedding components
           // are ~[-1, 1], so this is lossless for any similarity use but roughly
-          // halves the serialised size — which for high-dimension models
+          // halves the serialised size - which for high-dimension models
           // (4k–8k dims) keeps the tool result from bloating the client context
           // or exceeding its result-size limit. Dimensions are preserved.
           const compact = (embedding as number[]).map((x) => Number(x.toPrecision(7)));
@@ -2987,7 +3041,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         lines.push(`| Scope    | Calls | Prompt tokens | Completion tokens | Total tokens |`);
         lines.push(`|----------|------:|--------------:|------------------:|-------------:|`);
         lines.push(`| Session  | ${session.calls} | ${session.promptTokens.toLocaleString()} | ${session.completionTokens.toLocaleString()} | ${(session.promptTokens + session.completionTokens).toLocaleString()} |`);
-        lines.push(`| Lifetime | ${lifetime.totalCalls} | — | — | ${lifetime.totalTokens.toLocaleString()} |`);
+        lines.push(`| Lifetime | ${lifetime.totalCalls} | - | - | ${lifetime.totalTokens.toLocaleString()} |`);
         lines.push('');
 
         // Per-model block (union of session + lifetime model ids)
@@ -3008,7 +3062,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (s) {
               const avgTtft = s.ttftCalls > 0 ? Math.round(s.totalTtftMs / s.ttftCalls) : '—';
               const avgTokSec = s.perfCalls > 0 ? (s.totalTokPerSec / s.perfCalls).toFixed(1) : '—';
-              lines.push(`| ${modelId} | session | ${s.calls} | ${avgTtft} | ${avgTokSec} | — | — |`);
+              lines.push(`| ${modelId} | session | ${s.calls} | ${avgTtft} | ${avgTokSec} | - | - |`);
             }
             if (l) {
               const avgTtft = l.ttftCalls > 0 ? Math.round(l.totalTtftMs / l.ttftCalls) : '—';
@@ -3022,11 +3076,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lines.push(`No history for model: \`${filterModel}\`. Try \`list_models\` to see what's been used.`);
           lines.push('');
         } else {
-          lines.push(`No calls yet — delegate a task via \`chat\`, \`custom_prompt\`, \`code_task\`, or \`code_task_files\` to start building stats.`);
+          lines.push(`No calls yet - delegate a task via \`chat\`, \`custom_prompt\`, \`code_task\`, or \`code_task_files\` to start building stats.`);
           lines.push('');
         }
 
-        // Reasoning-token diagnostic (lifetime only — needs persistence to be meaningful)
+        // Reasoning-token diagnostic (lifetime only - needs persistence to be meaningful)
         if (!filterModel) {
           // Sum reasoning tokens across all models. We store this per-model
           // in SQLite but not in the in-memory mirror, so fetch on demand.
@@ -3040,13 +3094,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               lines.push('');
               lines.push(`${totalReasoning.toLocaleString()} / ${totalCompletion.toLocaleString()} completion tokens spent on hidden reasoning (${pct}% of generation budget). ` +
                 (parseFloat(pct) > 30
-                  ? `**High** — consider loading a non-thinking model, or check that \`reasoning_effort\` is being honoured (see stderr logs).`
+                  ? `**High** - consider loading a non-thinking model, or check that \`reasoning_effort\` is being honoured (see stderr logs).`
                   : parseFloat(pct) > 10
-                    ? `Moderate — normal for thinking-model families.`
-                    : `Low — reasoning is effectively suppressed.`));
+                    ? `Moderate - normal for thinking-model families.`
+                    : `Low - reasoning is effectively suppressed.`));
               lines.push('');
             }
-          } catch { /* best-effort — don't fail the tool call */ }
+          } catch { /* best-effort - don't fail the tool call */ }
         }
 
         lines.push(`*Stats persist across restarts in \`~/.houtini-lm/model-cache.db\`.*`);
@@ -3070,26 +3124,12 @@ async function main() {
   await server.connect(transport);
   process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)})\n`);
 
-  // Background: profile all available models via HF → SQLite cache
-  // Non-blocking — server is already accepting requests
+  // Background: fetch the model list, which profiles the models via HF into
+  // the SQLite cache (profileInBackground). Non-blocking - the server is
+  // already accepting requests. If the endpoint is down now, the first
+  // successful list later in the session does the profiling instead.
   fetchAndPublishModelList()
-    .then((models) => {
-      // Behind a router only self-hosted models need profiling - LiteLLM has
-      // no metadata for them. Hosted ones are already described by /model/info,
-      // and profiling each would cost a pointless HuggingFace round trip
-      // (a real router lists 100+).
-      const toProfile = getBackend() === 'litellm'
-        ? models.filter((m) => m.router_mode === null && m.type !== 'embeddings')
-        : models;
-      return profileModelsAtStartup(toProfile.map((m) => ({
-        id: m.id,
-        publisher: m.publisher,
-        arch: m.arch,
-        type: m.type,
-        upstream: m.upstream_model,
-      })));
-    })
-    .catch((err) => process.stderr.write(`[houtini-lm] Startup profiling skipped: ${err}\n`));
+    .catch((err) => process.stderr.write(`[houtini-lm] Endpoint not reachable at startup; models will be profiled on first contact: ${err}\n`));
 
   // Hydrate the in-memory lifetime mirror from SQLite so the very first
   // tool call this session shows historical savings + per-model perf.

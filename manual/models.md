@@ -6,7 +6,7 @@
 
 At startup houtini-lm asks your server for every model available, loaded and downloaded, then looks each one up on HuggingFace's free API for its architecture, licence, download count and chat template. All of that goes into a local SQLite cache (`~/.houtini-lm/model-cache.db`, refreshed every 7 days) so later startups are instant.
 
-For the families I know well there's a curated profile with specific strengths and weaknesses: Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS, DeepSeek, Gemma, Kimi and the hosted GPT-5/6 models. Anything else gets a profile generated from the HuggingFace lookup, so a model houtini-lm has never seen still gets described sensibly. `list_models` shows the lot.
+For the families I know well there's a curated profile with specific strengths and weaknesses: Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS, DeepSeek, Gemma, Kimi and OpenAI's hosted GPT models. Anything else gets a profile generated from the HuggingFace lookup, so a model houtini-lm has never seen still gets described sensibly. `list_models` shows the lot.
 
 ## Per-family prompt hints
 
@@ -22,9 +22,9 @@ Thinking models reason before they answer, and that reasoning comes out of the s
 
 **`off`** forces the no-think request on every call, detected or not. Use it when your backend serves a model under a name detection can't recognise (vLLM started with `--served-model-name coder-next`, for example), because otherwise a real thinking model looks like a plain one, never gets the toggle, and hands back its answer in `reasoning_content` with an empty reply.
 
-**`on`** forces thinking on. It's worth it for work where the model's own reasoning improves the answer, like hunting a subtle bug, checking an argument or planning something with several moving parts, and on a fast endpoint it's a good way to get a stronger second opinion. The cost is time and tokens: in one call to GPT-6 through my router, 326 of the 496 output tokens went on reasoning. houtini-lm still inflates the output budget when thinking is forced on, so the reasoning doesn't eat the answer, but on slow local hardware a thinking call can run past the MCP client's timeout, so keep `on` for the tasks that need it.
+**`on`** forces thinking on. It's worth it for work where the model's own reasoning improves the answer, like hunting a subtle bug, checking an argument or planning something with several moving parts, and on a fast endpoint it's a good way to get a stronger second opinion. The cost is time and tokens, because reasoning often takes the bigger share of the output (one GPT-6 call through my router spent 326 of its 496 output tokens reasoning, and open-weight thinking models are no more frugal). houtini-lm still inflates the output budget when thinking is forced on, so the reasoning doesn't eat the answer, but on slow local hardware a thinking call can run past the MCP client's timeout, so keep `on` for the tasks that need it.
 
-`HOUTINI_LM_THINKING` controls the `enable_thinking` toggle that open-weight chat templates understand. Hosted reasoning models (GPT-5/6, o-series, and anything on OpenRouter) manage their own reasoning, and on OpenRouter houtini-lm always asks for the reasoning to be left out of the reply.
+`HOUTINI_LM_THINKING` controls the `enable_thinking` toggle that open-weight chat templates understand. Hosted reasoning models (GPT-5/6, o-series, and anything on OpenRouter) manage their own reasoning, so the setting doesn't reach them, and on OpenRouter houtini-lm always asks for the reasoning to be left out of the reply.
 
 ### How the no-think path works
 
@@ -63,7 +63,9 @@ That's better than setting `HOUTINI_LM_CONTEXT_WINDOW`, which is one number for 
 
 ## Models that reject parameters
 
-Some hosted reasoning models refuse parameters that every other model accepts. GPT-6 returns a 400 on `temperature` and `max_tokens`, both of which houtini-lm sends, and LiteLLM's wildcard `drop_params` doesn't catch them because it only drops parameters it already knows a model rejects. The fix on a LiteLLM router is a named route that strips them:
+Some hosted reasoning models refuse parameters that every other model accepts. OpenAI's GPT-5 and GPT-6 families and the o-series reject `max_tokens` (replaced by `max_completion_tokens`, which also counts reasoning tokens), and GPT-6 returns a 400 on `temperature` too. Since 3.3.2 houtini-lm recognises these families by name, directly or behind a router alias, and sends them `max_completion_tokens` only, leaving out the sampling controls and the open-weight thinking toggles; the server log says what it left out. They manage their own reasoning, so `HOUTINI_LM_THINKING` doesn't apply to them.
+
+For any other model that rejects a parameter, the fix on a LiteLLM router is a named route that strips it. LiteLLM's wildcard `drop_params` won't catch it on its own, because it only drops parameters it already knows a model rejects. This is the route my router used for GPT-6 before 3.3.2:
 
 ```yaml
   - model_name: astra
