@@ -69,7 +69,7 @@ Past 30 models it switches to one line each (id, the real model behind a router 
 
 Just the numbers, no catalogue: tokens offloaded, calls made, per-model TTFT and tok/s - session and lifetime, persisted in `~/.houtini-lm/model-cache.db` across restarts. Also reports the reasoning-token overhead ratio, which is worth glancing at: if a big share of your completion tokens are going on hidden thinking, your no-think configuration isn't landing (see [troubleshooting](troubleshooting.md#responses-are-slow-and-the-token-counts-look-inflated)).
 
-The 💰 line is cumulative Claude quota kept in your pocket. It climbs quickly once `code_task_files` is in play.
+The 💰 line is the running total of tokens the other model handled for you: its prompt and completion tokens, hidden reasoning included. That's work Claude didn't do, but it isn't the same number as Claude tokens saved, which depends on what Claude would have spent doing the job itself (reading a file into context usually costs far more than the delegated call; the [README's benchmark](../README.md#why-use-houtini-lm) measures that). It climbs quickly once `code_task_files` is in play.
 
 ## Reading the footer
 
@@ -77,7 +77,7 @@ Every inference response ends with a footer. It's worth learning to read:
 
 ```
 Model: qwen3.6-27b | 353→2829 tokens | TTFT: 126ms, 18.8 tok/s, 150.3s | typescript · 1 file(s) read
-💰 Claude quota saved - this session: 3,809 tokens / 2 calls · lifetime: 150,158 tokens / 197 calls
+💰 Offloaded - this session: 3,809 tokens / 2 calls · lifetime: 150,158 tokens / 197 calls
 ```
 
 - `353→2829` - prompt tokens in, completion tokens out. If the output number dwarfs the visible text, the difference went on hidden reasoning.
@@ -85,7 +85,7 @@ Model: qwen3.6-27b | 353→2829 tokens | TTFT: 126ms, 18.8 tok/s, 150.3s | types
 - `tok/s` - decode speed, measured over generation only (prefill excluded, so it's honest).
 - Quality flags appear here too: `TRUNCATED` (hit the token budget - the budget logic makes this rare), `UPSTREAM ERROR`, `content_filter` (a refusal, not a length problem - don't retry it bigger), `think-strip-empty` (the whole response was reasoning; see troubleshooting).
 
-The same facts come back as data, too. Each inference tool returns `structuredContent` next to the text - model, token counts (including reasoning and cached), TTFT and tok/s, quality flags, finish reason and the quota counters - so an orchestrator can branch on `truncated` or a `content-filtered` flag without parsing the footer. The answer itself stays in the text.
+The same facts can come back as data, too. Set `HOUTINI_LM_STRUCTURED=1` and each inference tool also returns `structuredContent` - the answer, model, token counts (including reasoning and cached), TTFT and tok/s, quality flags, finish reason and the offload totals - so an orchestrator can branch on `truncated` or a `content-filtered` flag without parsing the footer. It's off by default for a reason I learned the hard way: Claude Code shows the model only the structured block when a result has one, so in 3.3.0 to 3.3.2, where it was always on, every delegated answer vanished and Claude saw just the metadata. Leave it off for Claude Code and Claude Desktop, and turn it on for your own scripts and orchestrators.
 
 ## The max_tokens floor
 

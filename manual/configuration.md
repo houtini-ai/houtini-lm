@@ -18,6 +18,7 @@
 | `HOUTINI_LM_RETRY_RATELIMIT` | *(off)* | Set to `1` to retry 429/5xx with jittered backoff on any backend. Already on for OpenRouter and LiteLLM routers; use it for other proxies that front a rate-limited API. |
 | `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:` or `,` separated allowlist of directories `code_task_files` may read from (symlinks resolved). Unset means any absolute path. |
 | `HOUTINI_LM_MAX_FILE_MB` | `10` | Per-file size cap for `code_task_files`. |
+| `HOUTINI_LM_STRUCTURED` | *(off)* | Set to `1` to add a `structuredContent` block (the answer plus model, tokens, timing, quality flags and offload totals) to each inference result, for your own scripts and orchestrators. Leave it off for Claude Code, which shows the model only that block when it's present. |
 
 ## Per-call settings
 
