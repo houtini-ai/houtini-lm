@@ -13,7 +13,7 @@
 | `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider handling: `openrouter` (attribution headers, `reasoning.exclude`, no serialisation) or `litellm` (router handling, 429 backoff). Otherwise OpenRouter is detected from the URL and LiteLLM from its `/model/info` endpoint. |
 | `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window when the API doesn't report one (`discover` says when it's guessing). It applies to every model, so behind a router give each model its real limits there instead. Legacy alias: `LM_CONTEXT_WINDOW`. |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`; anything lower is ignored in favour of the dynamic budget. Set to `0` to honour any value. |
-| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to turn off the request queue entirely, for backends that batch natively (vLLM, TGI, SGLang) and routers in front of cloud models. |
+| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` to turn off the request queue entirely, for cloud APIs (OpenAI, DeepSeek and the like), routers in front of cloud models, and backends that batch natively (vLLM, TGI, SGLang). OpenRouter skips the queue automatically. |
 | `HOUTINI_LM_CROSS_PROCESS_LOCK` | `1` | Set to `0` to disable just the cross-process lock (the in-process queue stays). |
 | `HOUTINI_LM_RETRY_RATELIMIT` | *(off)* | Set to `1` to retry 429/5xx with jittered backoff on any backend. Already on for OpenRouter and LiteLLM routers; use it for other proxies that front a rate-limited API. |
 | `HOUTINI_LM_FILE_ROOTS` | *(unset)* | Optional `:` or `,` separated allowlist of directories `code_task_files` may read from (symlinks resolved). Unset means any absolute path. |

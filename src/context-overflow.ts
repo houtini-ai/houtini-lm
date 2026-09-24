@@ -48,6 +48,23 @@ export function parseContextOverflow(text: string): number | null {
 }
 
 /**
+ * Extract a model's maximum OUTPUT tokens from a "budget too large" 400. A plain
+ * OpenAI endpoint doesn't report output caps in /v1/models, so the first call to
+ * a model with a small cap (gpt-4o-mini: 16,384) can overshoot. The error says
+ * the real cap; the caller retries once at it.
+ *
+ *   OpenAI: "max_tokens is too large: 25000. This model supports at most 16384
+ *            completion tokens, whereas you provided 25000."
+ */
+export function parseOutputCapOverflow(text: string): number | null {
+  if (!text) return null;
+  const m = text.match(/supports at most\s*([\d,]{2,})\s*(?:completion|output)\s*tokens/i);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ''));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
  * Given the real context limit and a prompt-size estimate, compute a safe
  * output budget that leaves room for the prompt. Mirrors the caller's original
  * cap heuristic (≈3 chars/token + per-message overhead + a margin) so a retry

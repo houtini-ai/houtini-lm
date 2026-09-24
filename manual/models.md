@@ -65,6 +65,8 @@ That's better than setting `HOUTINI_LM_CONTEXT_WINDOW`, which is one number for 
 
 Some hosted reasoning models refuse parameters that every other model accepts. OpenAI's GPT-5 and GPT-6 families and the o-series reject `max_tokens` (replaced by `max_completion_tokens`, which also counts reasoning tokens), and GPT-6 returns a 400 on `temperature` too. Since 3.3.2 houtini-lm recognises these families by name, directly or behind a router alias, and sends them `max_completion_tokens` only, leaving out the sampling controls and the open-weight thinking toggles; the server log says what it left out. They manage their own reasoning, so `HOUTINI_LM_THINKING` doesn't apply to them.
 
+A plain OpenAI endpoint also doesn't report context windows or output caps in its model list, so houtini-lm starts from its 100,000-token fallback. When a budget overshoots a model's real output cap (`gpt-4o-mini` stops at 16,384), OpenAI's error names the cap; houtini-lm retries once at that figure and remembers it for the rest of the session, so it only happens once per model. The same endpoint lists image, speech, transcription and moderation models beside the chat ones with nothing to tell them apart, so houtini-lm leaves those out by name and marks embedding models as embeddings.
+
 For any other model that rejects a parameter, the fix on a LiteLLM router is a named route that strips it. LiteLLM's wildcard `drop_params` won't catch it on its own, because it only drops parameters it already knows a model rejects. This is the route my router used for GPT-6 before 3.3.2:
 
 ```yaml
@@ -81,4 +83,4 @@ If you're pointing houtini-lm straight at a provider with no router in between, 
 
 ## Request queuing
 
-A single-GPU host can only serve one request at a time, so on local providers houtini-lm queues parallel tool calls and runs them one at a time, which gives each call its full timeout rather than stacking them. On remote providers the queue is skipped because the upstream handles parallelism itself. If you run vLLM, TGI or SGLang, which batch natively, or a router in front of cloud models, set `HOUTINI_LM_SERIALISE=0` to turn the queue off.
+A single-GPU host can only serve one request at a time, so by default houtini-lm queues parallel tool calls and runs them one at a time, which gives each call its full timeout rather than stacking them. houtini-lm can't tell a GPU under your desk from a cloud API by its URL, so the queue is on for every endpoint except OpenRouter, where it's skipped. For OpenAI and other cloud APIs, a router in front of cloud models, or vLLM, TGI and SGLang, which batch natively, set `HOUTINI_LM_SERIALISE=0` to turn the queue off.
