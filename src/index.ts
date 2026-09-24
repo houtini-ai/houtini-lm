@@ -46,6 +46,8 @@ import {
   isOpenAIReasoningModel,
   applyReasoningModelPolicy,
   modelKindFromName,
+  isUnsupportedSchemaFormat,
+  schemaInstruction,
   isConfidentPrefillEstimate,
   extractSamplingParams,
   validTemperature,
@@ -1202,9 +1204,22 @@ async function chatCompletionStreamingInner(
         if ('max_tokens' in body) body.max_tokens = corrected;
         body.max_completion_tokens = corrected;
         res = await issueRequest();
+      } else if (isUnsupportedSchemaFormat(errText, body)) {
+        // The backend doesn't do json_schema (DeepSeek: "This response_format
+        // type is unavailable"). Retry once in plain JSON mode with the schema
+        // written into the system prompt.
+        const rf = body.response_format as ResponseFormat;
+        const instruction = schemaInstruction(rf.json_schema!.schema);
+        const msgs = body.messages as ChatMessage[];
+        body.messages = msgs[0]?.role === 'system'
+          ? [{ ...msgs[0], content: `${msgs[0].content}\n\n${instruction}` }, ...msgs.slice(1)]
+          : [{ role: 'system', content: instruction }, ...msgs];
+        body.response_format = { type: 'json_object' };
+        process.stderr.write(`[houtini-lm] ${resolvedModel} doesn't accept json_schema; retrying once in JSON mode with the schema in the prompt.\n`);
+        res = await issueRequest();
       } else {
-        // Not a recoverable context overflow - surface the original error.
-        throw new Error(`LM Studio API error ${res.status}: ${errText}`);
+        // Not recoverable - surface the original error.
+        throw new Error(`${backendLabel()} endpoint error ${res.status}: ${errText}`);
       }
     }
   } finally {
@@ -1213,7 +1228,7 @@ async function chatCompletionStreamingInner(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`LM Studio API error ${res.status}: ${text}`);
+    throw new Error(`${backendLabel()} endpoint error ${res.status}: ${text}`);
   }
 
   if (!res.body) {

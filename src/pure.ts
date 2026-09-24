@@ -190,8 +190,60 @@ export function toResponseFormat(js: unknown): ResponseFormat | undefined {
   const hasWrapper = !!obj.schema && typeof obj.schema === 'object';
   const schema = (hasWrapper ? obj.schema : obj) as Record<string, unknown>;
   const name = hasWrapper && typeof obj.name === 'string' ? obj.name : 'response';
-  const strict = hasWrapper && typeof obj.strict === 'boolean' ? obj.strict : true;
-  return { type: 'json_schema', json_schema: { name, strict, schema } };
+  const prepared = prepareStrictSchema(schema);
+  // Strict unless the caller said otherwise AND the schema can be strict:
+  // OpenAI rejects a strict schema with optional properties outright, so a
+  // schema with them goes non-strict rather than failing or being rewritten.
+  const wanted = hasWrapper && typeof obj.strict === 'boolean' ? obj.strict : true;
+  return { type: 'json_schema', json_schema: { name, strict: wanted && prepared.strictOk, schema: prepared.schema } };
+}
+
+/**
+ * Make a JSON Schema acceptable to OpenAI's strict structured outputs, which
+ * require every object to declare `additionalProperties: false` and to list
+ * every property in `required`. The first is added wherever it's missing (it
+ * only forbids keys the schema never mentioned). The second would change the
+ * schema's meaning, so it's never forced: `strictOk` comes back false instead
+ * and the caller sends the schema non-strict. Returns a copy.
+ */
+export function prepareStrictSchema(schema: Record<string, unknown>): { schema: Record<string, unknown>; strictOk: boolean } {
+  let strictOk = true;
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (!node || typeof node !== 'object') return node;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      out[k] = k === 'properties' && v && typeof v === 'object' && !Array.isArray(v)
+        ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([pk, pv]) => [pk, walk(pv)]))
+        : walk(v);
+    }
+    const isObject = out.type === 'object' || (out.properties && typeof out.properties === 'object');
+    if (isObject) {
+      if (out.additionalProperties === undefined) out.additionalProperties = false;
+      else if (out.additionalProperties !== false) strictOk = false;
+      const props = Object.keys((out.properties as Record<string, unknown>) ?? {});
+      const required = Array.isArray(out.required) ? (out.required as unknown[]) : [];
+      if (props.some((p) => !required.includes(p))) strictOk = false;
+    }
+    return out;
+  };
+  return { schema: walk(schema) as Record<string, unknown>, strictOk };
+}
+
+/**
+ * Fallback for backends that don't support json_schema response formats
+ * (DeepSeek: "This response_format type is unavailable"). Plain JSON mode plus
+ * the schema written into the system prompt gets valid, usually conforming,
+ * JSON; json_object mode also needs the word "JSON" in the prompt, which this
+ * supplies.
+ */
+export function isUnsupportedSchemaFormat(errText: string, body: Record<string, unknown>): boolean {
+  const rf = body.response_format as ResponseFormat | undefined;
+  return rf?.type === 'json_schema' && !!rf.json_schema?.schema && /response_format|json_schema/i.test(errText);
+}
+
+export function schemaInstruction(schema: Record<string, unknown>): string {
+  return `Respond with a single JSON object that conforms to this JSON Schema, and nothing else:\n${JSON.stringify(schema)}`;
 }
 
 // ── Transport helpers ───────────────────────────────────────────────
