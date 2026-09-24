@@ -46,6 +46,8 @@ import {
   isOpenAIReasoningModel,
   applyReasoningModelPolicy,
   modelKindFromName,
+  envFlag,
+  structuredPart,
   isUnsupportedSchemaFormat,
   schemaInstruction,
   isConfidentPrefillEstimate,
@@ -308,9 +310,9 @@ function sessionSummary(): string {
   // Lifetime numbers only show once there's something in the DB - avoids a
   // confusing "lifetime: 0" on a truly fresh install.
   if (lifetime.totalCalls > 0) {
-    return `💰 Claude quota saved - ${sessionPart} · lifetime: ${lifetime.totalTokens.toLocaleString()} tokens / ${lifetime.totalCalls} ${callWord(lifetime.totalCalls)}`;
+    return `💰 Offloaded - ${sessionPart} · lifetime: ${lifetime.totalTokens.toLocaleString()} tokens / ${lifetime.totalCalls} ${callWord(lifetime.totalCalls)}`;
   }
-  return `💰 Claude quota saved ${sessionPart}`;
+  return `💰 Offloaded - ${sessionPart}`;
 }
 
 /**
@@ -2047,7 +2049,7 @@ function formatQualityLine(quality: QualitySignal): string {
  *   ---
  *   Model: ... | prompt→completion tokens | perf | extra | quality
  *   📊 [first-call benchmark line, only on the first measured call per model]
- *   💰 Claude quota saved this session: ...
+ *   💰 Offloaded - this session: ... (the other model's prompt + completion tokens)
  */
 function formatFooter(resp: StreamingResult, extra?: string): string {
   // Pure formatter. Accounting is the caller's job (recordUsage, once per
@@ -2119,14 +2121,16 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
 
 /**
  * Machine-readable sidecar for the inference tools, returned as `structuredContent`
- * alongside the human-readable text. Lets an orchestrator branch on quality, token
- * usage and quota savings without regex-parsing the footer. Metadata only - the
- * answer stays in the text content block, so the payload isn't duplicated. No
- * `outputSchema` is declared: on the low-level Server that would invoke client-side
- * validation and risk an outputSchema-aware client rendering only the structured
- * object and dropping the answer. Call AFTER recordUsage so quotaSaved reflects
- * the call just recorded.
+ * only when HOUTINI_LM_STRUCTURED is on (see structuredPart). Lets an orchestrator
+ * branch on quality, token usage and offload totals without regex-parsing the
+ * footer. It carries the answer too: Claude Code shows the model only the
+ * structured block when a result has one, with or without an outputSchema, which
+ * is how 3.3.0-3.3.2 lost every delegated answer. Call AFTER recordUsage so the
+ * totals reflect the call just recorded.
  */
+const STRUCTURED_OUTPUT = envFlag(process.env.HOUTINI_LM_STRUCTURED);
+const withStructured = (structured: Record<string, unknown>) => structuredPart(STRUCTURED_OUTPUT, structured);
+
 function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>): Record<string, unknown> {
   const quality = assessQuality(resp, resp.rawContent);
   const flags: string[] = [];
@@ -2140,6 +2144,9 @@ function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>)
   if (quality.finishReason === 'content_filter') flags.push('content-filtered');
   if (resp.streamError) flags.push('upstream-error');
   return {
+    // The answer itself, so a client that shows only structuredContent (Claude
+    // Code does, once a result carries it) still gets it.
+    answer: resp.content,
     model: resp.model || null,
     tokens: {
       prompt: resp.usage?.prompt_tokens ?? null,
@@ -2152,7 +2159,7 @@ function buildStructured(resp: StreamingResult, extra?: Record<string, unknown>)
     truncated: resp.truncated,
     finishReason: resp.finishReason || null,
     streamError: resp.streamError ?? null,
-    quotaSaved: {
+    offloaded: {
       sessionTokens: session.promptTokens + session.completionTokens,
       sessionCalls: session.calls,
       lifetimeTokens: lifetime.totalTokens,
@@ -2196,7 +2203,7 @@ const TOOLS = [
       '(3) Specific system persona beats generic - "Senior TypeScript dev" not "helpful assistant".\n' +
       '(4) State constraints - "no preamble", "reference line numbers", "max 5 bullets".\n' +
       '(5) Leave max_tokens UNSET - the server sizes the budget from the model\'s real context window. Tiny caps like 256 waste the model: reasoning burns the budget before any visible output.\n\n' +
-      'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens kept in the user\'s quota.',
+      'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens offloaded.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2415,7 +2422,7 @@ const TOOLS = [
       'Show user stats: tokens offloaded, calls made, per-model performance - for the current session AND ' +
       'lifetime (persisted in SQLite at ~/.houtini-lm/model-cache.db). Unlike `discover` which includes the ' +
       'model catalog, `stats` returns just the numbers in a compact markdown table - cheap to call repeatedly ' +
-      'to see the 💰 Claude-quota savings counter climb. Useful for quantifying how much work the local model ' +
+      'to see the 💰 offloaded counter climb. Useful for quantifying how much work the local model ' +
       'is genuinely doing, and for noticing when a model\'s reasoning-token ratio is drifting.',
     inputSchema: {
       type: 'object' as const,
@@ -2438,7 +2445,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Houtini-lm is a local LLM sidekick. It runs on the user's hardware (or a configured OpenAI-compatible endpoint) and handles bounded work without consuming the user's Claude quota.\n\n` +
   `When to reach for it: bounded, self-contained tasks you can describe in one message - explanations, boilerplate, test stubs, code review of pasted or file-loaded source, translations, commit messages, format conversion, brainstorming. Trades wall-clock time for tokens (typically 3-30× slower than frontier models).\n\n` +
   `When not to: tasks that need tool access, cross-file reasoning you haven't captured, or work fast enough to answer directly before the delegation round-trip completes.\n\n` +
-  `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and - after the first real call - its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
+  `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and - after the first real call - its measured speed. The response footer reports cumulative tokens offloaded (the other model's prompt and completion tokens).`;
 
 const server = new Server(
   { name: 'houtini-lm', version: SERVER_VERSION },
@@ -2547,7 +2554,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const footer = formatFooter(resp);
         return {
           content: [{ type: 'text', text: resp.content + footer }],
-          structuredContent: buildStructured(resp),
+          ...withStructured(buildStructured(resp)),
         };
       }
 
@@ -2599,7 +2606,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const footer = formatFooter(resp);
         return {
           content: [{ type: 'text', text: resp.content + footer }],
-          structuredContent: buildStructured(resp),
+          ...withStructured(buildStructured(resp)),
         };
       }
 
@@ -2649,7 +2656,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         return {
           content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }],
-          structuredContent: buildStructured(codeResp, { language: lang }),
+          ...withStructured(buildStructured(codeResp, { language: lang })),
         };
       }
 
@@ -2791,11 +2798,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
         return {
           content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }],
-          structuredContent: buildStructured(codeResp, {
+          ...withStructured(buildStructured(codeResp, {
             language: lang,
             filesRead: successCount,
             filesTotal: paths.length,
-          }),
+          })),
         };
       }
 
@@ -2860,7 +2867,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const summary = sessionSummary();
         const sessionStats = session.calls > 0 || lifetime.totalCalls > 0
           ? `\n${summary}`
-          : `\n💰 Claude quota saved this session: 0 tokens - no calls yet. Measured speed for each model will appear here after the first real call.`;
+          : `\n💰 Offloaded - this session: 0 tokens, no calls yet. Measured speed for each model will appear here after the first real call.`;
 
         // Measured speed line for the active model. Discover intentionally does
         // not run a synthetic warmup - speed is captured from real tasks, so the
@@ -3055,7 +3062,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
           return {
             content: [{ type: 'text', text: JSON.stringify(embedResult) }],
-            structuredContent: embedResult,
+            ...withStructured(embedResult),
           };
         });
       }

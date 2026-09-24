@@ -201,7 +201,7 @@ The inference tools (`chat`, `custom_prompt`, `code_task`, `code_task_files`) al
 }
 ```
 
-Each inference result also carries a `structuredContent` block (model, tokens, timing, quality flags) for clients and scripts that would rather read JSON than parse the footer.
+If you're driving houtini-lm from your own scripts rather than from Claude, set `HOUTINI_LM_STRUCTURED=1` and each inference result also carries a `structuredContent` block (the answer, model, tokens, timing, quality flags) to read as JSON. Leave it off for Claude Code, which shows the model only that block when it's present ([the tools page](./manual/tools.md#reading-the-footer) has the story).
 
 ## Reading the footer
 
@@ -211,10 +211,10 @@ Every response ends with a footer computed from the SSE stream itself:
 ---
 Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
 📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token - use this to gauge whether to delegate longer tasks.
-💰 Claude quota saved - this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
+💰 Offloaded - this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
 ```
 
-The first-call line appears once per model per session, and it's a benchmark from a real task rather than a synthetic warm-up. The savings line updates every call. When a model reports its reasoning tokens, the token count splits into reasoning and visible, so you can see when a thinking model is burning budget on hidden reasoning.
+The first-call line appears once per model per session, and it's a benchmark from a real task rather than a synthetic warm-up. The 💰 line updates every call, and it counts the tokens the other model handled (its prompt and completion, reasoning included), which is work Claude didn't do rather than a measure of Claude tokens saved; the benchmark above is the honest measure of that. When a model reports its reasoning tokens, the token count splits into reasoning and visible, so you can see when a thinking model is burning budget on hidden reasoning.
 
 When something went wrong, a quality line says so: `TRUNCATED` for a partial result (a stalled connection gives you what arrived rather than a timeout error), `hit-max-tokens` when the budget ran out, `think-blocks-stripped` when reasoning was removed and `tokens-estimated` when the server didn't report usage. Clean output gets no quality line at all.
 

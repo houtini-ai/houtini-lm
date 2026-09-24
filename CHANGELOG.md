@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.3.3] - 2026-09-24
+
+### Fixed
+- **Claude Code never received delegated answers (3.3.0-3.3.2).** Every inference result carried a `structuredContent` block, and Claude Code shows the model only that block when a result has one, even with no `outputSchema` declared. So `chat`, `custom_prompt`, `code_task` and `code_task_files` delivered token counts and timings, and the answer itself never arrived. `structuredContent` is now off by default; set `HOUTINI_LM_STRUCTURED=1` to turn it on for your own scripts and orchestrators, and when it's on the block carries the answer as well. A new end-to-end test spawns the server against a mock endpoint and checks what a client actually receives in both modes. Found by the content-machine session's cost test and reproduced in a Claude Code session through the Docker gateway.
+
+### Changed
+- **The footer's counter is labelled "Offloaded", not "Claude quota saved".** It counts the other model's prompt and completion tokens, hidden reasoning included, which is work Claude didn't do rather than Claude tokens saved; the README's benchmark measures the saving itself. The optional structured block's `quotaSaved` field is now `offloaded`.
+- **`server.json` points at `github.com/houtini-ai/houtini-lm`**, so the MCP registry entry shows the renamed repo.
+- **The Docker guide recommends `docker run -i`** for houtini-lm, drops `longLived`/`--long-lived` (workers piled up on an always-on gateway), replaces `--allow-unauthenticated` with a Bearer token, prefers Docker's secret store to a plain-text secrets file, and notes that pinning the package doesn't pin its dependencies.
+
 ## [3.3.2] - 2026-09-24
 
 ### Fixed

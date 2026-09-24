@@ -42,7 +42,7 @@ metadata.
   unless you use `code_task_files` with absolute paths.
 - Between each step, check the response footer. Note the model, TTFT, tok/s,
   any quality flags (think-blocks-stripped, TRUNCATED, tokens-estimated,
-  reasoning-only, PREFILL-STALL), and how the 💰 "Claude quota saved"
+  reasoning-only, PREFILL-STALL), and how the 💰 "Offloaded"
   number climbs over the session.
 - If the 📊 first-call benchmark line appears on the first measured call,
   record the tok/s figure — that's our baseline for deciding whether to

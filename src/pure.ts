@@ -302,6 +302,24 @@ export function extractStreamError(json: unknown): string | undefined {
   return JSON.stringify(err);
 }
 
+// ── Structured tool output ──────────────────────────────────────────
+
+/** Parse an on/off env var: 1, true, yes, on (any case) are on; anything else is off. */
+export function envFlag(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((raw ?? '').trim());
+}
+
+/**
+ * The `structuredContent` part of a tool result, or nothing. Off by default:
+ * Claude Code shows the model ONLY structuredContent when a result carries it,
+ * even with no outputSchema declared, so sending it by default (3.3.0-3.3.2)
+ * hid every delegated answer. Orchestrators that want the metadata opt in, and
+ * the structured block then carries the answer as well.
+ */
+export function structuredPart(enabled: boolean, structured: Record<string, unknown>): { structuredContent?: Record<string, unknown> } {
+  return enabled ? { structuredContent: structured } : {};
+}
+
 // ── Hosted reasoning models ─────────────────────────────────────────
 
 /**

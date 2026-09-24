@@ -58,7 +58,7 @@ export interface ModelProfile {
 /**
  * Persisted per-model performance record. Accumulates across sessions so
  * Claude sees real historical TTFT / tok/s from call 1 of a new session
- * (instead of "not yet benchmarked"), and so lifetime Claude-quota savings
+ * (instead of "not yet benchmarked"), and so lifetime offload totals
  * survive Claude Desktop restarts. Highly personal to the workstation —
  * that's intentional; routing decisions should reflect the user's real
  * hardware, not a synthetic benchmark.
@@ -931,7 +931,7 @@ export async function getAllPerformance(): Promise<CachedPerformance[]> {
 /**
  * Fetch workstation-wide lifetime totals: every call, every token ever
  * offloaded to local models, across every session. Used for the "Claude
- * quota saved" footer and the discover overview.
+ * Offloaded" footer and the discover overview.
  */
 export async function getLifetimeTotals(): Promise<{ totalTokens: number; totalCalls: number; modelsUsed: number; firstSeenAt: number | null }> {
   const database = await initDb();
