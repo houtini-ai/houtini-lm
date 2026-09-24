@@ -17,3 +17,11 @@ nul
 .claude-session-notes.md
 scratch/
 devkarts-v3screenshots/
+
+# Internal working notes - kept locally, not published
+TODO.md
+docs/AUDIT-*.md
+docs/CODE-REVIEW-*.md
+docs/PLATFORM-REVIEW-*.md
+docs/CLI-MODE.md
+docs/VLLM-BACKEND.md

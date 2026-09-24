@@ -40,10 +40,10 @@
   "homepage": "https://houtini.ai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/houtini-ai/lm.git"
+    "url": "git+https://github.com/houtini-ai/houtini-lm.git"
   },
   "bugs": {
-    "url": "https://github.com/houtini-ai/lm/issues"
+    "url": "https://github.com/houtini-ai/houtini-lm/issues"
   },
   "funding": {
     "type": "github",

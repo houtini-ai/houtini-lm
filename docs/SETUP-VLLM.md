@@ -5,8 +5,8 @@ quantization for long context. It serves an OpenAI-compatible API that houtini-l
 talks to directly. This guide gets it running and wired, and covers the handful of
 traps that make a delegated call come back empty or garbled if you miss them.
 
-> For the deeper "why it behaves this way" reference (reasoning-model token budgets,
-> the router topology, parser dialects), see [VLLM-BACKEND.md](./VLLM-BACKEND.md).
+> For the deeper "why it behaves this way" reference (thinking models, output budgets,
+> routers), see [How houtini-lm handles different models](../manual/models.md).
 > Prefer a desktop GUI with zero config? Use [SETUP-LMSTUDIO.md](./SETUP-LMSTUDIO.md)
 > instead - vLLM is worth it when you want throughput, parallel agents, or big context.
 
