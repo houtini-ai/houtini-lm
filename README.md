@@ -2,14 +2,14 @@
   <img src="https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/assets/logo.png" width="120" height="120" alt="Houtini LM" />
 </div>
 
-# Houtini LM (@houtini/lm) - Offload Work from Claude Code to a Local LLM, a Router or a Cheaper Cloud Model
+# Houtini LM (@houtini/lm) - Offload Work from Claude Code to a Local LLM, OpenAI GPT-5/6, a Router or a Cheaper Cloud Model
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Known Vulnerabilities](https://snyk.io/test/github/houtini-ai/houtini-lm/badge.svg)](https://snyk.io/test/github/houtini-ai/houtini-lm)
 
-**Houtini LM is an MCP server that lets Claude (or any MCP client) hand bounded work to another model - a local LLM on your GPU, a LiteLLM router, OpenRouter or a cheap cloud API - while you carry on working in the AI platform you already like. It cuts your token bill, and it gives you a second model to review your code whenever you want one.**
+**Houtini LM is an MCP server that lets Claude (or any MCP client) hand bounded work to another model - a local LLM on your GPU, OpenAI's latest GPT models, a LiteLLM router, OpenRouter or a cheap cloud API - while you carry on working in the AI platform you already like. It cuts your token bill, and it gives you a second model to review your code whenever you want one.**
 
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@houtini-ai/lm">
@@ -19,13 +19,17 @@
 
 > **Quick Navigation**
 >
-> [Why use it](#why-use-houtini-lm) | [Install](#install) | [How it handles different models](#how-houtini-lm-handles-different-models) | [What to hand over](#what-to-hand-over) | [Tools](#the-tools) | [Reading the footer](#reading-the-footer) | [Configuration](#configuration) | [Endpoints](#compatible-endpoints) | [The manual](#the-manual)
+> [What's new](#whats-new-in-33) | [Why use it](#why-use-houtini-lm) | [Install](#install) | [How it handles different models](#how-houtini-lm-handles-different-models) | [What to hand over](#what-to-hand-over) | [Tools](#the-tools) | [Reading the footer](#reading-the-footer) | [Configuration](#configuration) | [Endpoints](#compatible-endpoints) | [The manual](#the-manual)
 
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend went on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion, the sort of work that doesn't need Claude's reasoning or its tool access.
 
-So Claude stays the architect, doing the planning, the multi-file changes and the judgement calls, and houtini-lm passes the drafting to whatever model you've got running. That could be Qwen on a GPU box under your desk, a model behind a LiteLLM router, one of OpenRouter's 300+ models or DeepSeek at pennies per million tokens. Claude QAs everything that comes back.
+So Claude stays the architect, doing the planning, the multi-file changes and the judgement calls, and houtini-lm passes the drafting to whatever model you've got running. That could be Qwen on a GPU box under your desk, GPT-5 or GPT-6 straight from OpenAI, a model behind a LiteLLM router, one of OpenRouter's 300+ models or DeepSeek at pennies per million tokens. Claude QAs everything that comes back.
 
 I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/) if you'd like the longer story.
+
+## What's new in 3.3
+
+houtini-lm now speaks to far more than a local GPU. Point it at OpenAI directly and GPT-5, GPT-6 and the o-series reasoning models work without any router in between. They reject parameters every open model accepts (`max_tokens`, `temperature`), so houtini-lm sends them `max_completion_tokens` only, learns a model's output cap from its own error when the endpoint doesn't report it, and leaves the image, speech and moderation models out of the list. Point it at a LiteLLM router and it reads which real model sits behind each alias, along with that model's true context window and output cap, so a mixed fleet of local and hosted models is sized and profiled correctly. Thinking is now your call (`auto`, `off` or `on`), there's a [Docker guide](./manual/docker.md) built from a working deployment, and the [manual](#the-manual) has a page per job. The [changelog](./CHANGELOG.md) has the detail.
 
 ## Why use houtini-lm?
 
@@ -71,7 +75,7 @@ Claude's the architect, the other model's the drafter, and Claude checks everyth
 
 ## Install
 
-You'll need Node 22.5 or newer and an OpenAI-compatible endpoint: LM Studio, Ollama, vLLM, SGLang, a LiteLLM router or a cloud API key. In Claude Code, with LM Studio running on the same machine, it's one command:
+You'll need Node 22.5 or newer and an OpenAI-compatible endpoint: LM Studio, Ollama, vLLM, SGLang, a LiteLLM router, or a cloud API key for OpenAI, DeepSeek, Groq and the like. In Claude Code, with LM Studio running on the same machine, it's one command:
 
 ```bash
 claude mcp add houtini-lm -- npx -y @houtini/lm
@@ -86,7 +90,18 @@ claude mcp add houtini-lm \
   -- npx -y @houtini/lm
 ```
 
-[Installing houtini-lm](./manual/install.md) walks through every route: a GPU on another machine, cloud APIs, OpenRouter, a LiteLLM router, Claude Desktop and other MCP clients, plus how to check it worked and how to update. If you'd rather run it in a container, [Running houtini-lm in Docker](./manual/docker.md) covers both a plain `docker run -i` and serving it over HTTP behind Docker's MCP Gateway. New to local models altogether? Start with [Getting started](./docs/GETTING-STARTED.md), which covers which models fit on 16, 32, 64, 96 or 128 GB of VRAM.
+OpenAI works the same way. Pin the model you want, because OpenAI lists dozens and they all score the same in routing:
+
+```bash
+claude mcp add houtini-lm \
+  -e HOUTINI_LM_ENDPOINT_URL=https://api.openai.com \
+  -e HOUTINI_LM_API_KEY=sk-... \
+  -e HOUTINI_LM_MODEL=gpt-5.2 \
+  -e HOUTINI_LM_SERIALISE=0 \
+  -- npx -y @houtini/lm
+```
+
+[Installing houtini-lm](./manual/install.md) walks through every route: a GPU on another machine, OpenAI and other cloud APIs, OpenRouter, a LiteLLM router, Claude Desktop and other MCP clients, plus how to check it worked and how to update. If you'd rather run it in a container, [Running houtini-lm in Docker](./manual/docker.md) covers both a plain `docker run -i` and serving it over HTTP behind Docker's MCP Gateway. New to local models altogether? Start with [Getting started](./docs/GETTING-STARTED.md), which covers which models fit on 16, 32, 64, 96 or 128 GB of VRAM.
 
 To check everything's wired up, ask Claude to run houtini-lm's `discover` tool. It tells you the version, which endpoint it found, which model is active and how big its context window is.
 
@@ -122,7 +137,7 @@ Thinking is your decision, through `HOUTINI_LM_THINKING`. The default, `auto`, s
 
 With several models available, houtini-lm scores each against the task type and picks the best, and it suggests a better model rather than swapping one in, since loading a model takes minutes. On a big catalogue every unknown model scores the same and the first listed wins, so pin one with `HOUTINI_LM_MODEL`, or pass `model` on an individual call.
 
-Point it at a [LiteLLM](https://docs.litellm.ai) router and it reads `/model/info` as well, which tells it the real model behind each alias (my `local` alias is `qwen3.6-27b`) and, for hosted models, the true context window and output cap. Each alias is then profiled and sized as the model it actually is, the TTS, image and video models a router lists by the dozen are filtered out, and rate-limit errors are retried with backoff. Local servers get their calls queued one at a time, because a single GPU can only serve one request anyway, while cloud endpoints and routers run them in parallel.
+Point it at a [LiteLLM](https://docs.litellm.ai) router and it reads `/model/info` as well, which tells it the real model behind each alias (my `local` alias is `qwen3.6-27b`) and, for hosted models, the true context window and output cap. Each alias is then profiled and sized as the model it actually is, the TTS, image and video models a router lists by the dozen are filtered out, and rate-limit errors are retried with backoff. Calls are queued one at a time by default, because a single GPU can only serve one request anyway; OpenRouter skips the queue, and for OpenAI, a router or a batching backend like vLLM you can turn it off with `HOUTINI_LM_SERIALISE=0`.
 
 ## What to hand over
 
@@ -246,7 +261,7 @@ Most setups need only the first two or three of these. The full list, including 
 | `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. |
 | `HOUTINI_LM_MODEL` | *(auto-detect)* | The model calls use unless they name one. Pin it on routers and big catalogues. |
 | `HOUTINI_LM_THINKING` | `auto` | `auto`, `off` or `on` - see [Thinking: auto, off or on](./manual/models.md#thinking-auto-off-or-on). |
-| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` for backends that batch natively (vLLM, SGLang) and routers in front of cloud models. |
+| `HOUTINI_LM_SERIALISE` | `1` | Set to `0` for cloud APIs like OpenAI, routers in front of cloud models, and backends that batch natively (vLLM, SGLang). |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Set to `0` to honour any value. |
 
 ## Compatible endpoints
@@ -261,6 +276,7 @@ Anything that speaks the OpenAI `/v1/chat/completions` API will work:
 | [SGLang](https://github.com/sgl-project/sglang) | `http://localhost:30000` | Good for repeated-context work. See [Getting started](./docs/GETTING-STARTED.md) |
 | [LiteLLM](https://docs.litellm.ai) router | `http://localhost:4000` | Auto-detected: aliases resolved, real limits read, non-chat models filtered, 429 backoff |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
+| [OpenAI](https://platform.openai.com) | `https://api.openai.com` | GPT-5, GPT-6 and the o-series sent only the parameters they accept; image, speech and moderation models left out of the list. Pin a model |
 | [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models, auto-detected, parallel requests allowed |
 | [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | Very cheap per token |
 | [Groq](https://groq.com) | `https://api.groq.com/openai` | Fast |

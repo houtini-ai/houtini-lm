@@ -151,7 +151,9 @@ cascade above - design them together.
 models stop refusing open-ended writing · `discover` shows the version · the
 manual split by task (install, Docker, models, configuration) · parameter policy
 for OpenAI's hosted reasoning models (`max_completion_tokens` only, no sampling
-controls or chat-template toggles) · the hosted-OpenAI profile covers GPT-4 to
+controls or chat-template toggles) · non-chat models (image, speech, moderation)
+filtered by name on plain OpenAI-compatible endpoints · output caps learned from
+the endpoint's own "too large" error · the hosted-OpenAI profile covers GPT-4 to
 GPT-6 and the o-series · stale "local model" descriptions on router aliases ·
 empty "Best for:" lines · lazy re-profiling when the endpoint was down at startup
 · spaced hyphens instead of em-dashes in runtime output.

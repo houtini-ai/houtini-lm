@@ -17,6 +17,7 @@ import {
   resolveThinkingOverride,
   isOpenAIReasoningModel,
   applyReasoningModelPolicy,
+  modelKindFromName,
   GROUNDING_LINE,
 } from '../dist/pure.js';
 
@@ -231,4 +232,15 @@ test('applyReasoningModelPolicy', () => {
   const legacy = { max_tokens: 4096 };
   applyReasoningModelPolicy(legacy);
   assert.deepEqual(legacy, { max_completion_tokens: 4096 });
+});
+
+test('modelKindFromName', () => {
+  const other = ['dall-e-3', 'gpt-image-1', 'sora-2', 'tts-1-hd', 'gpt-4o-mini-tts', 'whisper-1',
+    'gpt-4o-transcribe', 'omni-moderation-latest', 'gpt-4o-realtime-preview', 'babbage-002', 'davinci-002'];
+  for (const id of other) assert.equal(modelKindFromName(id), 'other', id);
+  const embedding = ['text-embedding-3-small', 'nomic-embed-text', 'openai/text-embedding-ada-002', 'embeddinggemma-300m'];
+  for (const id of embedding) assert.equal(modelKindFromName(id), 'embedding', id);
+  const chat = ['gpt-5.2', 'gpt-6-astra', 'o4-mini', 'gpt-4o-mini', 'gpt-4o-audio-preview', 'gpt-4o-search-preview',
+    'deepseek-chat', 'qwen3-coder-30b', 'llama-3.3-70b', 'gpt-oss-120b'];
+  for (const id of chat) assert.equal(modelKindFromName(id), 'chat', id);
 });

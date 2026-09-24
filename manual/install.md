@@ -38,6 +38,21 @@ claude mcp add houtini-lm \
   -- npx -y @houtini/lm
 ```
 
+## OpenAI
+
+Point houtini-lm at OpenAI with your API key, and pin the model you want calls to use:
+
+```bash
+claude mcp add houtini-lm \
+  -e HOUTINI_LM_ENDPOINT_URL=https://api.openai.com \
+  -e HOUTINI_LM_API_KEY=sk-... \
+  -e HOUTINI_LM_MODEL=gpt-5.2 \
+  -e HOUTINI_LM_SERIALISE=0 \
+  -- npx -y @houtini/lm
+```
+
+`HOUTINI_LM_SERIALISE=0` lets calls run in parallel, which OpenAI handles fine (houtini-lm queues them by default, to protect single-GPU servers). Pinning matters more here than anywhere, because OpenAI lists dozens of models with nothing to tell them apart, so unpinned calls land on whichever comes first. houtini-lm leaves the image, speech, transcription and moderation models out of the list, sends GPT-5, GPT-6 and the o-series only the parameters they accept, and picks up any model's output cap from OpenAI's own error the first time a budget overshoots it. You can still pass `model` on a single call to use something else, `gpt-4o-mini` for cheap summaries, say. [How houtini-lm handles different models](models.md#models-that-reject-parameters) has the detail.
+
 ## OpenRouter
 
 houtini-lm recognises OpenRouter from the URL and switches on the attribution headers, `reasoning.exclude` and retry-with-backoff for you. Pin a model, because with 300+ in the catalogue every candidate scores the same:

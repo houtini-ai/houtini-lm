@@ -38,7 +38,7 @@ Look at the footer: `107→2229 tokens` on a short answer means ~2,100 tokens of
 
 ## Everything queues - parallel calls stack up
 
-**Serialisation is on by default,** in-process and cross-process (an advisory file lock), because most local backends hold one model on one GPU and interleaved requests just thrash it. If your backend batches properly - vLLM, TGI, SGLang - set `HOUTINI_LM_SERIALISE=0` and let it. `HOUTINI_LM_CROSS_PROCESS_LOCK=0` disables just the file lock if you want in-process politeness only.
+**Serialisation is on by default,** in-process and cross-process (an advisory file lock), because most local backends hold one model on one GPU and interleaved requests just thrash it. If your backend batches properly - vLLM, TGI, SGLang - or it's a cloud API like OpenAI or a router in front of one, set `HOUTINI_LM_SERIALISE=0` and let it. (Only OpenRouter skips the queue automatically; houtini-lm can't tell a cloud API from a GPU box by its URL.) `HOUTINI_LM_CROSS_PROCESS_LOCK=0` disables just the file lock if you want in-process politeness only.
 
 ## discover says the endpoint is offline
 

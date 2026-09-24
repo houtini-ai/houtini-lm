@@ -36,7 +36,7 @@ import {
 } from './model-cache.js';
 import { acquireInferenceLock } from './inference-lock.js';
 import { SERVER_VERSION } from './version.js';
-import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
+import { parseContextOverflow, parseOutputCapOverflow, correctedMaxTokens } from './context-overflow.js';
 import {
   CHARS_PER_TOKEN,
   autoOutputBudget,
@@ -45,6 +45,7 @@ import {
   resolveThinkingOverride,
   isOpenAIReasoningModel,
   applyReasoningModelPolicy,
+  modelKindFromName,
   isConfidentPrefillEstimate,
   extractSamplingParams,
   validTemperature,
@@ -855,6 +856,11 @@ function publishModelList(startedAt: number, models: ModelInfo[]): void {
   profileInBackground(models);
 }
 
+// Output caps learned from a model's own "max_tokens is too large" 400, for
+// endpoints that don't report them (plain OpenAI /v1/models). Consulted when
+// sizing budgets, so each model overshoots at most once per process.
+const learnedOutputCaps = new Map<string, number>();
+
 // Profiling runs once per process, on the first model list that has anything
 // in it - not just at boot. If the endpoint was down when the server started
 // (a GPU box still booting, vLLM still loading), the first successful list
@@ -936,7 +942,8 @@ async function chatCompletionStreamingInner(
   const modelEntry = await getModelEntry(options.model || LM_MODEL || undefined);
   const resolvedModel: string | undefined = options.model || LM_MODEL || modelEntry?.id || undefined;
   const contextLen: number | undefined = modelEntry ? getContextLength(modelEntry) : undefined;
-  const maxOutput: number | undefined = modelEntry?.max_output_tokens;
+  const maxOutput: number | undefined = modelEntry?.max_output_tokens
+    ?? (resolvedModel ? learnedOutputCaps.get(resolvedModel) : undefined);
 
   // Generous default (a quarter of the real context window), then clamped to
   // what the backend will accept: the model's declared max output (a hosted
@@ -1175,14 +1182,21 @@ async function chatCompletionStreamingInner(
     // its real limit in the error; parse it, resize the budget, and retry ONCE.
     if (!res.ok && res.status === 400) {
       const errText = await res.text().catch(() => '');
-      const realLimit = parseContextOverflow(errText);
       const currentMax = Number(body.max_tokens ?? body.max_completion_tokens) || 0;
-      const corrected = realLimit
-        ? correctedMaxTokens(realLimit, promptChars, messages.length)
-        : 0;
-      if (realLimit && corrected > 0 && corrected < currentMax) {
+      // Two recoverable shapes: the budget overflows the context window, or it
+      // exceeds the model's output cap (a plain OpenAI endpoint reports neither
+      // in /v1/models). The output cap is remembered for this model, so the
+      // retry only happens once per model per process.
+      const outputCap = parseOutputCapOverflow(errText);
+      const realLimit = outputCap ? null : parseContextOverflow(errText);
+      const corrected = outputCap
+        ?? (realLimit ? correctedMaxTokens(realLimit, promptChars, messages.length) : 0);
+      if (outputCap && resolvedModel) learnedOutputCaps.set(resolvedModel, outputCap);
+      if ((outputCap || realLimit) && corrected > 0 && corrected < currentMax) {
         process.stderr.write(
-          `[houtini-lm] Backend context is ${realLimit} tokens (smaller than the ${contextLen ?? 'unknown'} we detected - likely a proxy advertising a generic window). max_tokens ${currentMax} → ${corrected}; retrying once.\n`,
+          outputCap
+            ? `[houtini-lm] ${resolvedModel} caps output at ${outputCap} tokens (not reported by the endpoint). max_tokens ${currentMax} → ${corrected}; retrying once.\n`
+            : `[houtini-lm] Backend context is ${realLimit} tokens (smaller than the ${contextLen ?? 'unknown'} we detected - likely a proxy advertising a generic window). max_tokens ${currentMax} → ${corrected}; retrying once.\n`,
         );
         // Hosted reasoning models had max_tokens stripped - don't re-add it.
         if ('max_tokens' in body) body.max_tokens = corrected;
@@ -1664,7 +1678,15 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
     return enrichFromRouter(data.data, routerInfo);
   }
   detectedBackend = 'openai-compat';
-  return data.data;
+  // No router metadata, so classify by name: drop image/speech/moderation
+  // models (OpenAI's own list is mostly those) and type the embedding models
+  // so they route to embed, not chat. Types a backend already reported stand.
+  return data.data.flatMap((m) => {
+    if (m.type) return [m];
+    const kind = modelKindFromName(m.id);
+    if (kind === 'other') return [];
+    return [kind === 'embedding' ? { ...m, type: 'embeddings' } : m];
+  });
 }
 
 /**

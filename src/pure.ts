@@ -289,6 +289,26 @@ export function applyReasoningModelPolicy(body: Record<string, unknown>): string
   return dropped;
 }
 
+// ── Model kinds from the name alone ─────────────────────────────────
+
+/**
+ * A plain OpenAI-compatible /v1/models (OpenAI itself, and most cloud APIs)
+ * lists every model with no type, so image, speech, transcription and
+ * moderation models sit beside the chat models. Behind a LiteLLM router
+ * /model/info says which is which; everywhere else the name is all there is.
+ * Deliberately narrow - only families that are never chat models - so an
+ * unfamiliar name is kept rather than hidden.
+ */
+const NON_CHAT_NAME =
+  /(?:^|[\/\-_.])(?:dall-e|gpt-image|sora|tts|whisper|transcribe|moderation|realtime|babbage|davinci)(?:[\/\-_.]|\d|$)/i;
+const EMBEDDING_NAME = /(?:^|[\/\-_.])embed/i;
+
+export function modelKindFromName(id: string): 'chat' | 'embedding' | 'other' {
+  if (EMBEDDING_NAME.test(id)) return 'embedding';
+  if (NON_CHAT_NAME.test(id)) return 'other';
+  return 'chat';
+}
+
 // ── Thinking mode ───────────────────────────────────────────────────
 
 /**
