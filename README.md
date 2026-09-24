@@ -45,7 +45,7 @@ The obvious win is cost. When Claude delegates a review with `code_task_files`, 
 | Code explanation (833 lines) | 8,678 tokens | 744 tokens | 91% |
 
 <p align="center">
-  <img src="docs/token-savings-chart.svg" alt="Bar chart of Claude token use with and without delegation across four review tasks, averaging 93.3% saved" />
+  <img src="https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/docs/token-savings-chart.svg" alt="Bar chart of Claude token use with and without delegation across four review tasks, averaging 93.3% saved" />
 </p>
 
 That averages out at 93.3% saved across the session. To be fair, small tasks like a one-line question or a commit message don't save much, because the tool call overhead (around 250 tokens) is about the same size as the answer. Anything that involves reading files, which is most of a real coding session, pays for itself straight away. You can run the same benchmark against your own setup with `LM_STUDIO_URL=http://your-server:1234 node scripts/benchmark.mjs`.
@@ -298,9 +298,7 @@ This README is the overview, and the depth lives in these pages:
 | [Troubleshooting](./manual/troubleshooting.md) | Symptom > cause > fix for empty responses, timeouts, context-length 400s, queuing and routers |
 | [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
 | [LM Studio](./docs/SETUP-LMSTUDIO.md), [Ollama](./docs/SETUP-OLLAMA.md) and [vLLM](./docs/SETUP-VLLM.md) setup | Backend guides, each with the traps that cause silent failures |
-| [vLLM backend notes](./docs/VLLM-BACKEND.md) | Router topology, thinking toggles, token budgets and what houtini-lm reads from a router |
 | [Shakedown test](./docs/SHAKEDOWN.md) | The end-to-end check, as a script or as a prompt for Claude |
-| [CLI mode](./docs/CLI-MODE.md) | Scoped, not built yet: running houtini-lm as a command without the MCP timeout |
 | [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
 
 ## Development

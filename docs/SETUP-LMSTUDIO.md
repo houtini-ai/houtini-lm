@@ -6,7 +6,7 @@ way to get houtini-lm delegating, and its default settings just work.
 
 > Want throughput, parallel agents, or long context instead? See
 > [SETUP-VLLM.md](./SETUP-VLLM.md). For the deeper behaviour reference, see
-> [VLLM-BACKEND.md](./VLLM-BACKEND.md) (much of it applies to any thinking model).
+> [How houtini-lm handles different models](../manual/models.md) (much of it applies to any thinking model).
 
 ## 1. Install and download a model
 
