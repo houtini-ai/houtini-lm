@@ -10,6 +10,9 @@ import {
   validTemperature,
   extractSamplingParams,
   toResponseFormat,
+  prepareStrictSchema,
+  isUnsupportedSchemaFormat,
+  schemaInstruction,
   redactUrl,
   parseRetryAfter,
   extractStreamError,
@@ -116,22 +119,55 @@ test('extractSamplingParams', () => {
 });
 
 test('toResponseFormat', () => {
+  // An optional property can't be strict on OpenAI, so it goes non-strict,
+  // with additionalProperties: false added and the caller's object untouched.
   const schema = { type: 'object', properties: { answer: { type: 'string' } } };
-  const wrapped = toResponseFormat({ name: 'answer', schema, strict: false });
-  assert.deepEqual(wrapped, {
-    type: 'json_schema',
-    json_schema: { name: 'answer', schema, strict: false },
-  });
-  assert.equal(wrapped.json_schema.schema, schema);
-
   const bare = toResponseFormat(schema);
   assert.deepEqual(bare, {
     type: 'json_schema',
-    json_schema: { name: 'response', strict: true, schema },
+    json_schema: {
+      name: 'response',
+      strict: false,
+      schema: { type: 'object', properties: { answer: { type: 'string' } }, additionalProperties: false },
+    },
   });
-  assert.equal(bare.json_schema.schema, schema);
+  assert.equal(schema.additionalProperties, undefined);
+
+  // Every property required: strict by default, honouring an explicit false.
+  const full = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
+  assert.equal(toResponseFormat(full).json_schema.strict, true);
+  assert.equal(toResponseFormat({ name: 'a', schema: full, strict: false }).json_schema.strict, false);
+  assert.equal(toResponseFormat({ name: 'a', schema: full }).json_schema.name, 'a');
   assert.equal(toResponseFormat(null), undefined);
   assert.equal(toResponseFormat('x'), undefined);
+});
+
+test('prepareStrictSchema', () => {
+  const nested = {
+    type: 'object',
+    properties: {
+      issues: { type: 'array', items: { type: 'object', properties: { line: { type: 'number' } }, required: ['line'] } },
+    },
+    required: ['issues'],
+  };
+  const { schema, strictOk } = prepareStrictSchema(nested);
+  assert.equal(strictOk, true);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal(schema.properties.issues.items.additionalProperties, false);
+  // A property literally named "properties" isn't mistaken for a schema keyword.
+  const tricky = prepareStrictSchema({ type: 'object', properties: { properties: { type: 'string' } }, required: ['properties'] });
+  assert.equal(tricky.strictOk, true);
+  assert.deepEqual(tricky.schema.properties.properties, { type: 'string' });
+  // An open object (additionalProperties: true) can't be strict.
+  assert.equal(prepareStrictSchema({ type: 'object', properties: {}, additionalProperties: true }).strictOk, false);
+});
+
+test('isUnsupportedSchemaFormat + schemaInstruction', () => {
+  const body = { response_format: { type: 'json_schema', json_schema: { name: 'r', schema: { type: 'object' } } } };
+  assert.equal(isUnsupportedSchemaFormat('This response_format type is unavailable now', body), true);
+  assert.equal(isUnsupportedSchemaFormat('maximum context length is 4096', body), false);
+  assert.equal(isUnsupportedSchemaFormat('response_format bad', { response_format: { type: 'json_object' } }), false);
+  assert.match(schemaInstruction({ type: 'object' }), /JSON/);
 });
 
 test('redactUrl', () => {
