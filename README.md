@@ -260,6 +260,7 @@ Most setups need only the first two or three of these. The full list, including 
 | `HOUTINI_LM_ENDPOINT_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API, without `/v1`. |
 | `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. |
 | `HOUTINI_LM_MODEL` | *(auto-detect)* | The model calls use unless they name one. Pin it on routers and big catalogues. |
+| `HOUTINI_LM_FALLBACK_MODELS` | *(none)* | OpenRouter only. Comma-separated model ids tried, in order, when the primary model errors - rate limit, downtime, moderation refusal, context overflow. Billing follows whichever model served the request, and the footer reports it. |
 | `HOUTINI_LM_THINKING` | `auto` | `auto`, `off` or `on` - see [Thinking: auto, off or on](./manual/models.md#thinking-auto-off-or-on). |
 | `HOUTINI_LM_SERIALISE` | `1` | Set to `0` for cloud APIs like OpenAI, routers in front of cloud models, and backends that batch natively (vLLM, SGLang). |
 | `HOUTINI_LM_MIN_TOKENS` | `4096` | Floor for caller-supplied `max_tokens`. Set to `0` to honour any value. |
