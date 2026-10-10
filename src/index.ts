@@ -78,6 +78,15 @@ const LM_MODEL =
   process.env.HOUTINI_LM_MODEL ||
   process.env.LM_STUDIO_MODEL ||
   '';
+// OpenRouter only: comma-separated model ids to try, in order, when the primary
+// model errors - rate limit, downtime, moderation refusal or context-length
+// validation. Maps to OpenRouter's `models` routing parameter; every other
+// backend ignores the field.
+// https://openrouter.ai/docs/guides/routing/model-fallbacks
+const LM_FALLBACK_MODELS = (process.env.HOUTINI_LM_FALLBACK_MODELS || '')
+  .split(',')
+  .map((m) => m.trim())
+  .filter(Boolean);
 const LM_PASSWORD =
   process.env.HOUTINI_LM_API_KEY ||
   process.env.LM_STUDIO_PASSWORD ||
@@ -1032,6 +1041,17 @@ async function chatCompletionStreamingInner(
     body.max_tokens = inflated;
     body.max_completion_tokens = inflated;
     process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+    // Fallback routing. OpenRouter tries these in order when the primary model
+    // errors, so a rate-limited free tier degrades to the next model instead of
+    // failing the call. The primary is filtered out because `model` is already
+    // attempt one - `models` lists what follows it. Billing and the response
+    // `model` field both follow whichever model actually served the request, and
+    // the footer reports that field, so a fallback is visible to the caller.
+    const fallbackModels = LM_FALLBACK_MODELS.filter((m) => m !== modelId);
+    if (fallbackModels.length > 0) {
+      body.models = fallbackModels;
+      process.stderr.write(`[houtini-lm] OpenRouter fallback models: ${fallbackModels.join(', ')}\n`);
+    }
   } else if (modelId && !hostedReasoning) {
     // Behind a router the id is an alias ("local") that means nothing to the
     // detector. Check the upstream model it resolves to as well - that's what
