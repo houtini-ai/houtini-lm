@@ -18,7 +18,7 @@ jobs:
         # 22.x is the engines floor (node:sqlite); 24.x is current.
         node: ['22.x', '24.x']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
