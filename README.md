@@ -1,4 +1,6 @@
 <div align="center">
+
+[![Socket Badge](https://socket.dev/api/badge/npm/package/@houtini/lm)](https://socket.dev/npm/package/@houtini/lm)
   <img src="https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/assets/logo.png" width="120" height="120" alt="Houtini LM" />
 </div>
 
