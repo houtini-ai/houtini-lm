@@ -1,6 +1,4 @@
 <div align="center">
-
-[![Socket Badge](https://socket.dev/api/badge/npm/package/@houtini/lm)](https://socket.dev/npm/package/@houtini/lm)
   <img src="https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/assets/logo.png" width="120" height="120" alt="Houtini LM" />
 </div>
 
@@ -10,6 +8,7 @@
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Known Vulnerabilities](https://snyk.io/test/github/houtini-ai/houtini-lm/badge.svg)](https://snyk.io/test/github/houtini-ai/houtini-lm)
+[![Socket Badge](https://socket.dev/api/badge/npm/package/@houtini/lm)](https://socket.dev/npm/package/@houtini/lm)
 
 **Houtini LM is an MCP server that lets Claude (or any MCP client) hand bounded work to another model - a local LLM on your GPU, OpenAI's latest GPT models, a LiteLLM router, OpenRouter or a cheap cloud API - while you carry on working in the AI platform you already like. It cuts your token bill, and it gives you a second model to review your code whenever you want one.**
 
